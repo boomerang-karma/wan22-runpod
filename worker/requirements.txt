@@ -1,0 +1,14 @@
+# Versions the handler was written and CPU-tested against (Oct 2026). torch is installed separately in the Dockerfile.
+runpod==1.12.0
+diffusers==0.41.0
+transformers==5.19.0
+accelerate==1.15.0
+peft==0.21.2
+safetensors==0.8.0
+huggingface_hub[hf_xet]==1.33.0
+tokenizers==0.23.2
+sentencepiece
+ftfy==6.3.1
+numpy
+pillow
+boto3

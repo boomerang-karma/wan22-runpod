@@ -1,0 +1,68 @@
+# Copy to config.yaml (git-ignored) and fill in:   python wanctl.py init
+# The API key can also come from the RUNPOD_API_KEY environment variable, which takes precedence over this file.
+
+runpod:
+  api_key: ""                       # RunPod console -> Settings -> API Keys. Never commit this file.
+  # The network volume (and therefore the endpoint) lives in ONE data center. Pick one where your GPU types show
+  # availability (console -> Storage -> New Network Volume shows availability per DC). Examples:
+  # EU-RO-1, EU-SE-1, EU-CZ-1, US-KS-2, US-TX-3, US-GA-2, US-IL-1, CA-MTL-1
+  data_center: ""
+
+image:
+  name: ""                          # e.g. ghcr.io/<github-user>/wan22-runpod-worker:0.1.0 or docker.io/<user>/...
+  registry_auth_id: ""              # only for a private image: RunPod console -> Settings -> Container Registry Auth
+
+network_volume:
+  id: ""                            # reuse an existing volume (same data center); empty = create one on deploy
+  name: wan22-weights
+  size_gb: 100                      # prepared model is ~69 GB; volumes can grow later but never shrink
+
+endpoint:
+  name: wan22-i2v-lightning
+  # Priority order. 80 GB cards are needed for memory_mode "resident". IDs must match RunPod's enum exactly.
+  gpu_types:
+    - "NVIDIA A100 80GB PCIe"
+    - "NVIDIA A100-SXM4-80GB"
+    - "NVIDIA H100 80GB HBM3"
+    - "NVIDIA H100 PCIe"
+  workers_min: 0                    # 0 = scale to zero (no idle cost). >0 keeps warm workers billed 24/7.
+  workers_max: 1
+  idle_timeout_s: 5                 # seconds a worker stays alive (billed) after a job, waiting for the next one
+  execution_timeout_s: 900          # default per-job cap; `prepare` sends its own longer limit
+  flashboot: true
+  container_disk_gb: 100            # prepare streams the 126 GB fp32 source through here one component at a time
+  min_cuda_version: "13.0"          # must match the torch build in worker/Dockerfile (PyPI torch 2.14.1 = CUDA 13.0)
+
+worker_env:                         # passed to the worker as environment variables
+  MEMORY_MODE: resident             # resident (80 GB GPU) | offload (48 GB GPU, needs ~75 GB host RAM)
+  VAE_TILING: "0"                   # "1" lowers decode VRAM at a small quality/speed cost
+  INLINE_LIMIT_MB: "8"              # return videos inline up to this base64 size; larger ones need a bucket
+  LORA_STRENGTH_HIGH: "1.0"
+  LORA_STRENGTH_LOW: "1.0"
+  # Optional S3-compatible bucket (S3, Cloudflare R2, ...) for large outputs; leave empty to return inline.
+  BUCKET_ENDPOINT_URL: ""
+  BUCKET_NAME: ""
+  BUCKET_ACCESS_KEY_ID: ""
+  BUCKET_SECRET_ACCESS_KEY: ""
+
+# USD per GPU-hour for the cost estimate printed after each job (serverless flex rates; check runpod.io/pricing).
+# Matched by substring against the GPU name the worker reports.
+pricing_per_hour:
+  "H200": 5.93
+  "H100": 4.79
+  "A100": 2.72
+  "L40S": 1.75
+  "A6000": 1.22
+  "5090": 1.58
+  "4090": 1.10
+
+generate_defaults:
+  resolution: 720p                  # 720p (720x1280 portrait) | 480p (480x832) — 480p is ~2.5x cheaper for drafts
+  num_frames: 81                    # 81 frames @ 16 fps = 5.06 s (the model's trained length)
+  steps: 4
+  flow_shift: 5.0
+  fps: 16
+  crf: 19
+  timeout_s: 900
+
+output_dir: outputs

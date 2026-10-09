@@ -1,0 +1,11 @@
+# secrets and local state — never commit
+config.yaml
+.env
+.runpod_state.json
+
+# generated
+outputs/
+.mock_volume/
+__pycache__/
+*.pyc
+.venv/

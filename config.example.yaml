@@ -5,7 +5,7 @@ runpod:
   api_key: ""                       # RunPod console -> Settings -> API Keys. Never commit this file.
   # The network volume (and therefore the endpoint) lives in ONE data center. Pick one where your GPU types show
   # availability (console -> Storage -> New Network Volume shows availability per DC). Examples:
-  # EU-RO-1, EU-SE-1, EU-CZ-1, US-KS-2, US-TX-3, US-GA-2, US-IL-1, CA-MTL-1
+  # EU-RO-1, EU-FR-1, US-TX-3, US-IL-1, US-NC-2, CA-MTL-1, AP-JP-1 (deploy errors list the current valid set)
   data_center: ""
 
 image:

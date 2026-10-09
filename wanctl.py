@@ -276,8 +276,8 @@ def cmd_prepare(args) -> None:
     cfg = load_config(args.config)
     rp, ep = RunPod(api_key(cfg)), _endpoint_id(cfg)
     token = hf_token(cfg)
-    print("Preparing weights on the network volume. This downloads ~115 GB from Hugging Face on a GPU worker and\n"
-          "writes ~72 GB; expect roughly 20-40 minutes of billed GPU time once. Safe to re-run (skips if prepared).")
+    print("Preparing weights on the network volume. This downloads ~71 GB from Hugging Face on a GPU worker\n"
+          "(about 8 minutes of billed GPU time once, plus any wait for a free GPU). Safe to re-run (skips if prepared).")
     st = run_job(rp, ep, {"input": {"action": "prepare", "force": args.force, "hf_token": token},
                           "policy": {"executionTimeout": int(args.timeout_min) * 60 * 1000}}, poll_s=20)
     print(json.dumps(st.get("output") or st.get("error"), indent=2))

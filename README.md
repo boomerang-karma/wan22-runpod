@@ -52,7 +52,7 @@ $4.79/h). Your first runs replace these: every `generate` prints billed seconds 
 | 720p 5 s clip, warm worker | ~45–75 s ≈ **$0.03–0.06** | ≈ $0.03–0.05 |
 | 1080p 5 s clip, warm worker | ~1.5–2.5 min ≈ **$0.07–0.11** | ≈ $0.05–0.09 |
 | Cold start (load ~72 GB from the volume) | +2–5 min per fresh worker ≈ $0.10–0.25 | same time, ≈ $0.15–0.40 |
-| `prepare`, once | ~20–40 min ≈ $0.9–1.8 | ≈ $1.6–3.2 |
+| `prepare`, once | measured 7.7 min ≈ $0.35 | ≈ $0.60 |
 | Network volume 100 GB | $7 / month while it exists | |
 
 Longer clips cost more than linearly (attention). Batch shots back to back so they share one warm worker.
@@ -84,7 +84,7 @@ python wanctl.py deploy
 
 **3. Prepare the weights (once):**
 ```bash
-python wanctl.py prepare              # ~20-40 min; prints progress; safe to re-run
+python wanctl.py prepare              # ~8 min of GPU time; prints progress; safe to re-run
 python wanctl.py info                 # worker reports GPU, cold-start time, what it loaded
 ```
 

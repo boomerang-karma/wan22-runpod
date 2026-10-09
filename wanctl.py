@@ -263,12 +263,12 @@ def run_job(rp: RunPod, ep: str, payload: dict, poll_s: float, quiet: bool = Fal
 
 
 def hf_token(cfg: dict) -> str:
-    token = os.getenv("HF_TOKEN") or (cfg.get("worker_env") or {}).get("HF_TOKEN") or ""
+    token = os.getenv("HF_TOKEN") or (cfg.get("huggingface") or {}).get("token") or ""
     if not token.strip():
         raise CtlError("no Hugging Face token. The LTX-2.5 weights are gated:\n"
                        "  1. sign in at https://huggingface.co/Lightricks/LTX-2.5-Diffusers and accept the license\n"
                        "  2. create a read token at https://huggingface.co/settings/tokens\n"
-                       "  3. export HF_TOKEN=hf_... and run prepare again")
+                       "  3. put it in config.yaml -> huggingface.token (or export HF_TOKEN=hf_...) and run prepare again")
     return token.strip()
 
 

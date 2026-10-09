@@ -102,6 +102,11 @@ def test_prepare_needs_an_hf_token_and_sends_it_only_in_the_job(tmp_path, monkey
         sent.append(payload), {"status": "COMPLETED", "output": {"status": "prepared"}})[1])
     assert wanctl.main(["--config", str(p), "prepare"]) == 0
     assert sent[0]["input"]["hf_token"] == "hf_SECRET" and "hf_SECRET" not in capsys.readouterr().out
+    monkeypatch.delenv("HF_TOKEN")
+    p.write_text(yaml.safe_dump(cfg(huggingface={"token": "hf_FROMFILE"})))
+    assert wanctl.main(["--config", str(p), "prepare"]) == 0
+    assert sent[1]["input"]["hf_token"] == "hf_FROMFILE"
+    assert "hf_FROMFILE" not in str(wanctl.template_payload(cfg(huggingface={"token": "hf_FROMFILE"})))
 
 
 def test_gitignore_protects_secrets():

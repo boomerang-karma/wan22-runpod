@@ -70,7 +70,8 @@ python wanctl.py check                # validates the key (read-only)
 ```
 
 **Hugging Face access (once):** sign in, open https://huggingface.co/Lightricks/LTX-2.5-Diffusers and click
-*Agree and Access*; then create a **read** token at https://huggingface.co/settings/tokens.
+*Agree and Access*; then create a **read** token at https://huggingface.co/settings/tokens and put it in
+`config.yaml` → `huggingface.token` (or `export HF_TOKEN=...`).
 
 **1. Build the worker image:** GitHub → Actions → *build-worker* → Run with a new tag (e.g. `0.2.0`) → put
 `ghcr.io/<you>/wan22-runpod-worker:<tag>` in `image.name`. Or `make build` with Docker buildx.
@@ -83,7 +84,6 @@ python wanctl.py deploy
 
 **3. Prepare the weights (once):**
 ```bash
-export HF_TOKEN=hf_...
 python wanctl.py prepare              # ~20-40 min; prints progress; safe to re-run
 python wanctl.py info                 # worker reports GPU, cold-start time, what it loaded
 ```

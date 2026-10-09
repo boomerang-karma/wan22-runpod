@@ -8,6 +8,10 @@ runpod:
   # EU-RO-1, EU-FR-1, US-TX-3, US-IL-1, US-NC-2, CA-MTL-1, AP-JP-1 (deploy errors list the current valid set)
   data_center: ""
 
+huggingface:
+  token: ""                         # read token for the gated LTX-2.5 weights (huggingface.co/settings/tokens).
+                                    # Used only by `wanctl.py prepare`; not stored on RunPod. HF_TOKEN env wins.
+
 image:
   name: ""                          # e.g. ghcr.io/<github-user>/wan22-runpod-worker:0.1.0 or docker.io/<user>/...
   registry_auth_id: ""              # only for a private image: RunPod console -> Settings -> Container Registry Auth
@@ -38,7 +42,6 @@ worker_env:                         # passed to the worker as environment variab
   MEMORY_MODE: resident             # resident (80 GB GPU) | offload (48 GB GPU, needs ~80 GB host RAM)
   VAE_TILING: "1"                   # tiled decode keeps 1080p within 80 GB; "0" is slightly faster at 540p/720p
   INLINE_LIMIT_MB: "8"              # return videos inline up to this base64 size; larger ones need a bucket
-  # The Hugging Face token for the gated weights is NOT stored here: export HF_TOKEN before `wanctl.py prepare`.
   # Optional S3-compatible bucket (S3, Cloudflare R2, ...) for large outputs; leave empty to return inline.
   BUCKET_ENDPOINT_URL: ""
   BUCKET_NAME: ""

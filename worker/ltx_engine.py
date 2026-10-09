@@ -2,8 +2,9 @@
 
 Two responsibilities:
   prepare()   one-time: download the gated Diffusers checkpoint (Lightricks/LTX-2.5-Diffusers, needs an HF token
-              whose account accepted the license), one component at a time through the container disk; re-save the
-              fp32 distilled transformer and the text connectors in bf16; write ~72 GB to the network volume.
+              whose account accepted the license), one component at a time, and write ~71 GB (bf16) to the network
+              volume. Some folders ship the same weights twice with different sharding, so only the shards named
+              by each component's *.index.json are fetched.
   LTXEngine   per-worker: load the prepared model once, then generate() a clip + audio track per request.
 
 Design notes (why it is shaped this way):
@@ -39,9 +40,8 @@ log = logging.getLogger("ltx_engine")
 SRC_REPO = os.getenv("LTX_REPO", "Lightricks/LTX-2.5-Diffusers")
 SRC_REVISION = os.getenv("LTX_REVISION", "a97165959b05f5eb52a9f40f19c55957e334abe9") or None   # pinned 2026-10-08
 MARKER = "prepared.json"
-COPY_AS_IS = ("scheduler", "tokenizer", "vae", "audio_vae", "vocoder", "duration_head", "latent_upsampler",
-              "text_encoder")
-CAST_BF16 = ("connectors", "transformer")       # shipped larger than needed (the distilled transformer is fp32)
+COMPONENTS = ("scheduler", "tokenizer", "vae", "audio_vae", "vocoder", "duration_head", "latent_upsampler",
+              "connectors", "text_encoder", "transformer")
 REQUIRED = ("scheduler", "tokenizer", "text_encoder", "connectors", "transformer", "vae", "audio_vae", "vocoder",
             "latent_upsampler")
 UNGUIDED = {"guidance_scale": 1.0, "audio_guidance_scale": 1.0, "stg_scale": 0.0, "audio_stg_scale": 0.0,
@@ -122,26 +122,26 @@ def prepare(out_dir: str, work_dir: str, device: str = "cuda", progress: Progres
     with open(os.path.join(src, "model_index.json")) as f:
         index = json.load(f)
 
-    # one component at a time, so the container disk never holds more than the biggest one (~76 GB transformer)
-    for sub in COPY_AS_IS + CAST_BF16:
+    # one component at a time, so the container disk never holds more than the biggest one (~38 GB transformer)
+    for sub in COMPONENTS:
         if sub not in index and sub != "latent_upsampler":        # the upsampler is not a pipeline component
             continue
-        fetch([f"{sub}/*"])
+        fetch([f"{sub}/*.json"])
+        indexes = [f for f in os.listdir(os.path.join(src, sub)) if f.endswith(".index.json")] \
+            if os.path.isdir(os.path.join(src, sub)) else []
+        if indexes:                                                # only the shards the index points at
+            with open(os.path.join(src, sub, indexes[0])) as f:
+                shards = sorted(set(json.load(f)["weight_map"].values()))
+            fetch([f"{sub}/{s}" for s in shards])
+            stats[sub] = {"shards": len(shards)}
+        else:
+            fetch([f"{sub}/*"])
         if not os.path.isdir(os.path.join(src, sub)):
             if sub in REQUIRED:
                 raise RuntimeError(f"{SRC_REPO}@{SRC_REVISION} has no {sub}/ folder; the repo layout changed")
             continue
-        t = time.time()
-        if sub in CAST_BF16:
-            model = _load(index, src, sub, torch.bfloat16)
-            model.save_pretrained(os.path.join(partial, sub), max_shard_size="10GB")
-            stats[sub] = {"params_b": round(sum(p.numel() for p in model.parameters()) / 1e9, 2), "dtype": "bfloat16"}
-            del model
-            _free(device)
-            shutil.rmtree(os.path.join(src, sub), ignore_errors=True)
-        else:
-            shutil.move(os.path.join(src, sub), os.path.join(partial, sub))
-        progress(f"{sub}: saved in {time.time() - t:.0f}s")
+        shutil.move(os.path.join(src, sub), os.path.join(partial, sub))
+        progress(f"{sub}: saved")
 
     import diffusers
     import transformers

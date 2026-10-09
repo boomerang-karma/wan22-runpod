@@ -1,5 +1,5 @@
-"""prepare(): per-component download -> bf16 re-save of the big parts -> marker -> atomic rename, against a fake hub
-that serves the tiny checkpoint; then load the result with LTXEngine and generate."""
+"""prepare(): per-component download (indexed shards only) -> marker -> atomic rename, against a fake hub that serves
+the tiny checkpoint laid out like the real repo; then load the result with LTXEngine and generate."""
 import fnmatch
 import json
 import os
@@ -33,12 +33,14 @@ def _tensors(folder):
 @pytest.fixture()
 def fake_hub(tmp_path, monkeypatch):
     repo = build_tiny_model_dir(str(tmp_path / "hub_repo"), marker=False)
-    for sub in ("transformer", "connectors"):                  # ship them fp32, like the real distilled transformer
-        folder = os.path.join(repo, sub)
-        for f in os.listdir(folder):
-            if f.endswith(".safetensors"):
-                sd = load_file(os.path.join(folder, f))
-                save_file({k: v.float() for k, v in sd.items()}, os.path.join(folder, f))
+    # like the real repo: the transformer is sharded with an index AND ships an unused single-file duplicate
+    from diffusers import LTX2VideoTransformer3DModel
+    folder = os.path.join(repo, "transformer")
+    LTX2VideoTransformer3DModel.from_pretrained(folder).save_pretrained(folder + "_sharded", max_shard_size="20KB")
+    for f in os.listdir(folder + "_sharded"):
+        shutil.copy2(os.path.join(folder + "_sharded", f), folder)
+    shutil.rmtree(folder + "_sharded")
+    assert os.path.exists(os.path.join(folder, "diffusion_pytorch_model.safetensors"))
     calls = []
 
     def snapshot_download(repo_id, revision=None, local_dir=None, allow_patterns=None, token=None, **_):
@@ -57,7 +59,7 @@ def fake_hub(tmp_path, monkeypatch):
     return repo, calls
 
 
-def test_prepare_builds_a_loadable_bf16_model(fake_hub, tmp_path):
+def test_prepare_builds_a_loadable_model_without_duplicate_shards(fake_hub, tmp_path):
     repo, calls = fake_hub
     out = str(tmp_path / "volume" / "model")
     msgs = []
@@ -65,13 +67,13 @@ def test_prepare_builds_a_loadable_bf16_model(fake_hub, tmp_path):
     assert res["status"] == "prepared"
     assert not os.path.exists(out + ".partial") and not os.path.exists(str(tmp_path / "work" / "ltx_src"))
     patterns = [p for p, _ in calls]
-    assert all(len(p) == 1 for p in patterns)                                  # one component at a time
-    assert ("transformer/*",) in patterns and ("latent_upsampler/*",) in patterns
-    for sub in ("transformer", "connectors"):
-        sd = _tensors(os.path.join(out, sub))
-        floats = [v for v in sd.values() if v.is_floating_point()]
-        assert floats and any(v.dtype == torch.bfloat16 for v in floats), sub
-        assert res[sub]["dtype"] == "bfloat16"
+    assert all(all(x.startswith(p[0].split("/")[0] + "/") for x in p) for p in patterns[1:])   # one component at a time
+    assert ("transformer/*",) not in patterns and ("latent_upsampler/*",) in patterns
+    tdir = os.path.join(out, "transformer")
+    assert res["transformer"]["shards"] > 1
+    assert "diffusion_pytorch_model.safetensors" not in os.listdir(tdir)                 # the duplicate stayed behind
+    assert _tensors(tdir).keys() == load_file(os.path.join(repo, "transformer",
+                                                            "diffusion_pytorch_model.safetensors")).keys()
     for sub in ("vae", "audio_vae", "vocoder", "text_encoder", "tokenizer", "scheduler", "latent_upsampler"):
         assert os.listdir(os.path.join(out, sub)), sub
     meta = json.load(open(os.path.join(out, "prepared.json")))

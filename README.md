@@ -12,8 +12,8 @@ RunPod serverless worker, plus a small CLI (`wanctl.py`). Each clip comes with a
 | Verified here (CPU, `make test`, 29 tests) | Not verified (needs your first GPU run) |
 |---|---|
 | Engine runs end to end on a tiny random LTX-2 (load → encode → 8-step stage 1 → x2 latent upsample → 3-step stage 2 → video + audio decode) | Real 22B weights on a real GPU: speed, peak VRAM, quality |
-| Single-stage draft path, seed determinism, prompt pre-encoding, OOM fallback | Exact class names in the real `model_index.json` (gated; prepare reports a clear error if they differ) |
-| `prepare()`: per-component download, bf16 re-save, atomic save, idempotent re-run, clear error without HF access | Network-volume read speed → cold-start time |
+| Single-stage draft path, seed determinism, prompt pre-encoding, OOM fallback | (Checked against the real `model_index.json` and shard indexes, 2026-10-09) |
+| `prepare()`: per-component download of indexed shards only, atomic save, idempotent re-run, clear error without HF access | Network-volume read speed → cold-start time |
 | Handler through the RunPod SDK test runner (mock engine) → real H.264 + AAC mp4 | |
 | Client payloads, dry-run deploy, key and token hygiene, cost maths | |
 
@@ -27,8 +27,8 @@ your Mac ── wanctl.py ──REST──▶ RunPod: network volume (1 DC) + te
 ```
 
 * **prepare (once):** downloads `Lightricks/LTX-2.5-Diffusers` (pinned revision) one component at a time through
-  the container disk, re-saves the fp32 distilled transformer and text connectors in bf16, and writes ~72 GB to the
-  network volume. Needs a Hugging Face token (below); the token is sent in the prepare job only and never stored.
+  the container disk (only the shards each component's index uses; the repo ships some weights twice) and writes
+  ~71 GB to the network volume. Needs a Hugging Face token (below); the token is sent in the prepare job only and never stored.
 * **generate:** the distilled recipe from the model card: fixed sigma schedules, no guidance (one pass per step,
   no negative prompt). Transformer, VAEs, vocoder and upsampler stay on the GPU; the 12B Gemma text encoder waits in
   host RAM and visits the GPU only to encode the prompt.

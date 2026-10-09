@@ -1,7 +1,8 @@
-"""RunPod serverless entry point for Wan 2.2 image-to-video (Lightning 4-step).
+"""RunPod serverless entry point for LTX-2.5 image-to-video with synchronized audio (distilled).
 
 Actions (job["input"]["action"]):
-  generate (default)  image + prompt -> mp4 (inline base64, or a presigned URL when a bucket is configured)
+  generate (default)  image + prompt -> mp4 with an AAC audio track (inline base64, or a presigned URL when a bucket
+                      is configured)
   prepare             one-time weight preparation onto the network volume, then the worker restarts itself
   info                cheap health/metadata check (no generation)
 
@@ -31,18 +32,20 @@ log = logging.getLogger("handler")
 PROCESS_START = time.time()
 MODE = os.getenv("WORKER_MODE", "real")                    # "real" | "mock" (CPU, for local tests)
 VOLUME = os.getenv("VOLUME_PATH", "/runpod-volume")
-MODEL_DIR = os.path.join(VOLUME, os.getenv("MODEL_SUBDIR", "wan22-i2v-a14b-lightning-bf16"))
-WORK_DIR = os.getenv("WORK_DIR", "/tmp/wan_work")         # container disk; needs ~70 GB free during prepare
+MODEL_DIR = os.path.join(VOLUME, os.getenv("MODEL_SUBDIR", "ltx25-i2v-distilled-bf16"))
+WORK_DIR = os.getenv("WORK_DIR", "/tmp/ltx_work")         # container disk; needs ~80 GB free during prepare
 MEMORY_MODE = os.getenv("MEMORY_MODE", "resident")
-VAE_TILING = os.getenv("VAE_TILING", "0") == "1"
+VAE_TILING = os.getenv("VAE_TILING", "1") == "1"
 INLINE_LIMIT_MB = float(os.getenv("INLINE_LIMIT_MB", "8"))   # base64 size; /run payloads are capped at 10 MB
 MAX_IMAGE_MB = 25
-RESOLUTIONS = {"480p": (480, 832), "720p": (720, 1280)}   # (short, long) sides; multiples of 16
+# (short, long, two_stage). Two-stage runs at half size then upsamples x2, so its sides must be multiples of 64.
+RESOLUTIONS = {"540p": (544, 960, False), "720p": (704, 1280, True), "1080p": (1088, 1920, True)}
+MAX_SECONDS = 20.0
 
 if MODE == "mock":
     import mock_engine as engine_mod
 else:
-    import wan_engine as engine_mod
+    import ltx_engine as engine_mod
 
 ENGINE = None
 LOAD_ERROR: str | None = None
@@ -60,7 +63,7 @@ def _load_engine() -> None:
         if MODE == "mock":
             ENGINE = engine_mod.MockEngine()
         else:
-            ENGINE = engine_mod.WanEngine(MODEL_DIR, memory_mode=MEMORY_MODE, vae_tiling=VAE_TILING)
+            ENGINE = engine_mod.LTXEngine(MODEL_DIR, memory_mode=MEMORY_MODE, vae_tiling=VAE_TILING)
         COLD_START_S = round(time.time() - PROCESS_START, 1)
         log.info("engine ready on %s in %.1fs (memory_mode=%s)", ENGINE.gpu, COLD_START_S, MEMORY_MODE)
     except Exception as e:                                     # keep the worker alive so `info` can report it
@@ -87,19 +90,6 @@ def _int(inp: dict, key: str, default: int, lo: int, hi: int) -> int:
     return v
 
 
-def _float(inp: dict, key: str, default, lo: float, hi: float):
-    v = inp.get(key, default)
-    if v is None:
-        return None
-    try:
-        v = float(v)
-    except (TypeError, ValueError):
-        raise BadInput(f"'{key}' must be a number")
-    if not lo <= v <= hi:
-        raise BadInput(f"'{key}' must be between {lo} and {hi}")
-    return v
-
-
 def _read_image(inp: dict) -> Image.Image:
     if inp.get("image_base64"):
         data = inp["image_base64"]
@@ -113,7 +103,7 @@ def _read_image(inp: dict) -> Image.Image:
         url = inp["image_url"]
         if not url.startswith(("https://", "http://")):
             raise BadInput("'image_url' must be http(s)")
-        req = urllib.request.Request(url, headers={"User-Agent": "wan22-runpod-worker"})
+        req = urllib.request.Request(url, headers={"User-Agent": "ltx25-runpod-worker"})
         with urllib.request.urlopen(req, timeout=30) as r:
             raw = r.read(MAX_IMAGE_MB * 2**20 + 1)
     else:
@@ -128,17 +118,26 @@ def _read_image(inp: dict) -> Image.Image:
     return img
 
 
-def _target_size(inp: dict, img: Image.Image) -> tuple[int, int]:
+def _bool(inp: dict, key: str, default: bool) -> bool:
+    v = inp.get(key, default)
+    if not isinstance(v, bool):
+        raise BadInput(f"'{key}' must be true or false")
+    return v
+
+
+def _target_size(inp: dict, img: Image.Image) -> tuple[int, int, bool]:
     if inp.get("width") or inp.get("height"):
-        w, h = _int(inp, "width", 0, 256, 1280), _int(inp, "height", 0, 256, 1280)
-        if w % 16 or h % 16:
-            raise BadInput("'width' and 'height' must be multiples of 16")
-        return w, h
+        two_stage = _bool(inp, "two_stage", True)
+        w, h = _int(inp, "width", 0, 256, 1920), _int(inp, "height", 0, 256, 1920)
+        mult = 64 if two_stage else 32
+        if w % mult or h % mult:
+            raise BadInput(f"'width' and 'height' must be multiples of {mult}" + (" (two-stage)" if two_stage else ""))
+        return w, h, two_stage
     res = inp.get("resolution", "720p")
     if res not in RESOLUTIONS:
         raise BadInput(f"'resolution' must be one of {sorted(RESOLUTIONS)}")
-    short, long = RESOLUTIONS[res]
-    return (short, long) if img.height >= img.width else (long, short)
+    short, long, two_stage = RESOLUTIONS[res]
+    return ((short, long) if img.height >= img.width else (long, short)) + (two_stage,)
 
 
 def _cover(img: Image.Image, w: int, h: int) -> Image.Image:
@@ -153,32 +152,37 @@ def parse(inp: dict) -> dict:
     if len(prompt) > 4000:
         raise BadInput("'prompt' is longer than 4000 characters")
     img = _read_image(inp)
-    w, h = _target_size(inp, img)
-    nf = _int(inp, "num_frames", 81, 5, 121)
-    if (nf - 1) % 4:
-        raise BadInput("'num_frames' must be 4k+1 (e.g. 49, 65, 81)")
+    w, h, two_stage = _target_size(inp, img)
+    fps = _int(inp, "fps", 24, 12, 50)
+    nf = _int(inp, "num_frames", 121, 9, 1001)
+    if (nf - 1) % 8:
+        raise BadInput("'num_frames' must be 8k+1 (e.g. 97, 121, 241)")
+    if nf / fps > MAX_SECONDS:
+        raise BadInput(f"clip is {nf / fps:.1f} s; the model supports up to {MAX_SECONDS:.0f} s (num_frames / fps)")
     seed = inp.get("seed")
     seed = random.randint(0, 2**31 - 1) if seed is None else _int(inp, "seed", 0, 0, 2**31 - 1)
     return {
-        "image": _cover(img, w, h), "prompt": prompt, "negative_prompt": inp.get("negative_prompt") or "",
-        "width": w, "height": h, "num_frames": nf, "seed": seed,
-        "steps": _int(inp, "steps", 4, 1, 50),
-        "guidance": _float(inp, "guidance_scale", 1.0, 1.0, 15.0),
-        "guidance_2": _float(inp, "guidance_scale_2", None, 1.0, 15.0),
-        "shift": _float(inp, "flow_shift", 5.0, 1.0, 20.0),
-        "fps": _int(inp, "fps", 16, 1, 60),
+        "image": _cover(img, w, h), "prompt": prompt, "width": w, "height": h, "two_stage": two_stage,
+        "num_frames": nf, "fps": fps, "seed": seed, "audio": _bool(inp, "audio", True),
         "crf": _int(inp, "crf", 19, 10, 35),
     }
 
 
 # ----------------------------------------------------------------------------------------------- output handling
-def encode_mp4(frames, fps: int, crf: int) -> bytes:
+def encode_mp4(frames, fps: int, crf: int, audio=None, sample_rate: int = 0) -> bytes:
+    """H.264 video from uint8 frames [F,H,W,3]; plus AAC from float audio [channels, samples] when given."""
     n, h, w, _ = frames.shape
     with tempfile.TemporaryDirectory() as d:
         out = os.path.join(d, "out.mp4")
         cmd = ["ffmpeg", "-loglevel", "error", "-y", "-f", "rawvideo", "-pix_fmt", "rgb24", "-s", f"{w}x{h}",
-               "-r", str(fps), "-i", "-", "-c:v", "libx264", "-preset", "medium", "-crf", str(crf),
-               "-pix_fmt", "yuv420p", "-movflags", "+faststart", out]
+               "-r", str(fps), "-i", "-"]
+        if audio is not None:
+            raw = os.path.join(d, "audio.f32")
+            audio.T.astype("<f4").tofile(raw)                      # interleaved little-endian float32
+            cmd += ["-f", "f32le", "-ar", str(sample_rate), "-ac", str(audio.shape[0]), "-i", raw,
+                    "-c:a", "aac", "-b:a", "192k"]
+        cmd += ["-c:v", "libx264", "-preset", "medium", "-crf", str(crf), "-pix_fmt", "yuv420p",
+                "-movflags", "+faststart", out]
         p = subprocess.run(cmd, input=frames.tobytes(), capture_output=True)
         if p.returncode:
             raise RuntimeError(f"ffmpeg failed: {p.stderr.decode()[-800:]}")
@@ -211,15 +215,17 @@ def _progress(job: dict, msg: str) -> None:
 
 def do_info() -> dict:
     meta = getattr(ENGINE, "meta", None)
-    return {"ready": ENGINE is not None, "error": LOAD_ERROR, "mode": MODE, "memory_mode": MEMORY_MODE,
+    return {"ready": ENGINE is not None, "error": LOAD_ERROR, "mode": MODE, "model": "LTX-2.5 distilled (I2V + audio)",
+            "memory_mode": MEMORY_MODE,
             "model_dir": MODEL_DIR, "gpu": getattr(ENGINE, "gpu", None), "cold_start_s": COLD_START_S,
             "prepared": meta, "inline_limit_mb": INLINE_LIMIT_MB, "bucket": _bucket_configured()}
 
 
 def do_prepare(job: dict, inp: dict) -> dict:
     device = "cpu" if MODE == "mock" else "cuda"
+    token = inp.get("hf_token") or os.getenv("HF_TOKEN") or None       # gated repo; never echoed back
     res = engine_mod.prepare(MODEL_DIR, WORK_DIR, device=device, force=bool(inp.get("force")),
-                             progress=lambda m: _progress(job, m))
+                             progress=lambda m: _progress(job, m), token=token)
     # restart this worker so the next job loads the freshly prepared model at import time
     return {"refresh_worker": True, "job_results": res}
 
@@ -235,13 +241,12 @@ def do_generate(job: dict, inp: dict) -> dict:
         return {"error": f"bad input: {e}"}
     t_parse = time.time() - t0
 
-    frames, timings = ENGINE.generate(
-        p["image"], p["prompt"], p["width"], p["height"], num_frames=p["num_frames"], steps=p["steps"],
-        guidance=p["guidance"], guidance_2=p["guidance_2"], shift=p["shift"], seed=p["seed"],
-        negative_prompt=p["negative_prompt"], progress=lambda m: _progress(job, m))
+    frames, audio, sample_rate, timings = ENGINE.generate(
+        p["image"], p["prompt"], p["width"], p["height"], num_frames=p["num_frames"], frame_rate=float(p["fps"]),
+        seed=p["seed"], two_stage=p["two_stage"], progress=lambda m: _progress(job, m))
 
     t = time.time()
-    video = encode_mp4(frames, p["fps"], p["crf"])
+    video = encode_mp4(frames, p["fps"], p["crf"], audio if p["audio"] else None, sample_rate)
     timings.update({"input_s": round(t_parse, 2), "encode_mp4_s": round(time.time() - t, 2),
                     "handler_total_s": round(time.time() - t0, 2)})
     if _FIRST_JOB:
@@ -249,13 +254,13 @@ def do_generate(job: dict, inp: dict) -> dict:
         _FIRST_JOB = False
 
     out = {"seed": p["seed"], "width": p["width"], "height": p["height"], "num_frames": p["num_frames"],
-           "fps": p["fps"], "steps": p["steps"], "flow_shift": p["shift"], "guidance_scale": p["guidance"],
+           "fps": p["fps"], "two_stage": p["two_stage"], "audio": p["audio"] and audio is not None,
            "gpu": ENGINE.gpu, "memory_mode": ENGINE.memory_mode, "video_bytes": len(video), "timings": timings}
     b64_mb = len(video) * 4 / 3 / 2**20
     if b64_mb <= INLINE_LIMIT_MB:
         out["video_base64"] = base64.b64encode(video).decode()
     elif _bucket_configured():
-        out["video_url"] = upload(video, f"wan22/{job.get('id', 'job')}.mp4")
+        out["video_url"] = upload(video, f"ltx25/{job.get('id', 'job')}.mp4")
     else:
         out["error"] = (f"video is {b64_mb:.1f} MB as base64 (> INLINE_LIMIT_MB={INLINE_LIMIT_MB}); raise 'crf', "
                         f"lower 'resolution', or configure a bucket (BUCKET_* env)")

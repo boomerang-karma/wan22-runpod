@@ -9,6 +9,7 @@ huggingface_hub[hf_xet]==1.33.0
 tokenizers==0.23.2
 sentencepiece
 ftfy==6.3.1
+av==19.0.1                 # image-conditioning H.264 re-compression the model was trained with
 numpy
 pillow
 boto3

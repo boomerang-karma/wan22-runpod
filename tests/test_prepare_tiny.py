@@ -1,11 +1,12 @@
-"""prepare(): download -> bf16 -> fuse LoRA per expert -> save -> marker -> atomic rename, against a fake hub that
-serves the tiny checkpoint, then load the result with WanEngine and generate."""
+"""prepare(): per-component download -> bf16 re-save of the big parts -> marker -> atomic rename, against a fake hub
+that serves the tiny checkpoint; then load the result with LTXEngine and generate."""
 import fnmatch
 import json
 import os
 import shutil
 import sys
 
+import httpx
 import numpy as np
 import pytest
 import torch
@@ -16,22 +17,34 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "worker"))
 sys.path.insert(0, os.path.dirname(__file__))
 
 import huggingface_hub  # noqa: E402
-import wan_engine  # noqa: E402
-from tiny_wan import build_tiny_model_dir, fake_lightning_lora  # noqa: E402
+import ltx_engine  # noqa: E402
+from huggingface_hub.errors import GatedRepoError  # noqa: E402
+from tiny_ltx import build_tiny_model_dir  # noqa: E402
+
+
+def _tensors(folder):
+    sd = {}
+    for f in os.listdir(folder):
+        if f.endswith(".safetensors"):
+            sd.update(load_file(os.path.join(folder, f)))
+    return sd
 
 
 @pytest.fixture()
 def fake_hub(tmp_path, monkeypatch):
-    repo = build_tiny_model_dir(str(tmp_path / "hub_repo"))
-    os.remove(os.path.join(repo, "prepared.json"))                       # a real hub repo has no marker
-    lora_dir = tmp_path / "hub_lora"
-    lora_dir.mkdir()
-    save_file(fake_lightning_lora(style="down_up_alpha"), str(lora_dir / "high.safetensors"))
-    save_file(fake_lightning_lora(style="down_up_alpha"), str(lora_dir / "low.safetensors"))
-    downloads = []
+    repo = build_tiny_model_dir(str(tmp_path / "hub_repo"), marker=False)
+    for sub in ("transformer", "connectors"):                  # ship them fp32, like the real distilled transformer
+        folder = os.path.join(repo, sub)
+        for f in os.listdir(folder):
+            if f.endswith(".safetensors"):
+                sd = load_file(os.path.join(folder, f))
+                save_file({k: v.float() for k, v in sd.items()}, os.path.join(folder, f))
+    calls = []
 
-    def snapshot_download(repo_id, revision=None, local_dir=None, allow_patterns=None, **_):
-        downloads.append(tuple(allow_patterns))
+    def snapshot_download(repo_id, revision=None, local_dir=None, allow_patterns=None, token=None, **_):
+        calls.append((tuple(allow_patterns), token))
+        if token != "hf_test":
+            raise GatedRepoError("401 gated", response=httpx.Response(401, request=httpx.Request("GET", "https://hf.co")))
         for root, _, files in os.walk(repo):
             for fn in files:
                 rel = os.path.relpath(os.path.join(root, fn), repo)
@@ -40,50 +53,41 @@ def fake_hub(tmp_path, monkeypatch):
                     shutil.copy2(os.path.join(root, fn), os.path.join(local_dir, rel))
         return local_dir
 
-    def hf_hub_download(repo_id, filename, revision=None, cache_dir=None, **_):
-        return str(lora_dir / ("high.safetensors" if "high" in filename else "low.safetensors"))
-
     monkeypatch.setattr(huggingface_hub, "snapshot_download", snapshot_download)
-    monkeypatch.setattr(huggingface_hub, "hf_hub_download", hf_hub_download)
-    return repo, downloads
+    return repo, calls
 
 
-def test_prepare_builds_a_loadable_fused_bf16_model(fake_hub, tmp_path):
-    repo, downloads = fake_hub
+def test_prepare_builds_a_loadable_bf16_model(fake_hub, tmp_path):
+    repo, calls = fake_hub
     out = str(tmp_path / "volume" / "model")
     msgs = []
-    res = wan_engine.prepare(out, str(tmp_path / "work"), device="cpu", progress=msgs.append)
+    res = ltx_engine.prepare(out, str(tmp_path / "work"), device="cpu", progress=msgs.append, token="hf_test")
     assert res["status"] == "prepared"
-    assert res["transformer"]["lora_modules"] == 20 and res["transformer_2"]["lora_modules"] == 20
-    assert not os.path.exists(out + ".partial") and not os.path.exists(str(tmp_path / "work" / "wan_src"))
-    assert downloads[-2:] == [("transformer/*",), ("transformer_2/*",)]            # one expert at a time
-    for sub in ("transformer", "transformer_2"):                                       # saved bf16, fused, no LoRA keys
-        files = [f for f in os.listdir(os.path.join(out, sub)) if f.endswith(".safetensors")]
-        sd = {}
-        for f in files:
-            sd.update(load_file(os.path.join(out, sub, f)))
-        keep32 = tuple(wan_engine.WanTransformer3DModel._keep_in_fp32_modules)     # diffusers keeps norms/time emb fp32
-        big = {k: v for k, v in sd.items() if not any(m in k for m in keep32)}
-        assert big and all(v.dtype == torch.bfloat16 for v in big.values()), {k: v.dtype for k, v in big.items()}
-        assert not any("lora" in k for k in sd)
-        src = {}
-        for f in os.listdir(os.path.join(repo, sub)):
-            if f.endswith(".safetensors"):
-                src.update(load_file(os.path.join(repo, sub, f)))
-        k = "blocks.0.attn1.to_q.weight"
-        assert (sd[k].float() - src[k].to(torch.bfloat16).float()).abs().max() > 1e-3     # the LoRA really landed
-    te = {}
-    for f in os.listdir(os.path.join(out, "text_encoder")):
-        if f.endswith(".safetensors"):
-            te.update(load_file(os.path.join(out, "text_encoder", f)))
-    assert te and all(v.dtype == torch.bfloat16 for v in te.values() if v.is_floating_point())   # 11 GB, not 22 GB
+    assert not os.path.exists(out + ".partial") and not os.path.exists(str(tmp_path / "work" / "ltx_src"))
+    patterns = [p for p, _ in calls]
+    assert all(len(p) == 1 for p in patterns)                                  # one component at a time
+    assert ("transformer/*",) in patterns and ("latent_upsampler/*",) in patterns
+    for sub in ("transformer", "connectors"):
+        sd = _tensors(os.path.join(out, sub))
+        floats = [v for v in sd.values() if v.is_floating_point()]
+        assert floats and any(v.dtype == torch.bfloat16 for v in floats), sub
+        assert res[sub]["dtype"] == "bfloat16"
+    for sub in ("vae", "audio_vae", "vocoder", "text_encoder", "tokenizer", "scheduler", "latent_upsampler"):
+        assert os.listdir(os.path.join(out, sub)), sub
     meta = json.load(open(os.path.join(out, "prepared.json")))
-    assert meta["dtype"] == "bfloat16" and "seconds" in meta
+    assert meta["dtype"] == "bfloat16" and meta["source"] == "Lightricks/LTX-2.5-Diffusers" and "seconds" in meta
+    assert "hf_test" not in json.dumps(meta) and "hf_test" not in " ".join(msgs)       # token never persisted
 
-    again = wan_engine.prepare(out, str(tmp_path / "work"), device="cpu")               # idempotent
+    again = ltx_engine.prepare(out, str(tmp_path / "work"), device="cpu")             # idempotent, no download
     assert again["status"] == "already_prepared"
 
-    eng = wan_engine.WanEngine(out, device="cpu", dtype=torch.float32)
-    frames, _ = eng.generate(Image.new("RGB", (32, 48), (90, 160, 220)), "a hero with balloons", width=32, height=48,
-                             num_frames=5, steps=4, seed=3)
-    assert frames.shape == (5, 48, 32, 3) and frames.dtype == np.uint8
+    eng = ltx_engine.LTXEngine(out, device="cpu", vae_tiling=False, dtype=torch.float32)
+    frames, audio, _, _ = eng.generate(Image.new("RGB", (64, 64), (90, 160, 220)), "a hero with balloons",
+                                       width=64, height=64, num_frames=5, seed=3)
+    assert frames.shape == (5, 64, 64, 3) and frames.dtype == np.uint8 and audio.shape[0] == 2
+
+
+def test_prepare_without_access_explains_how_to_fix_it(fake_hub, tmp_path):
+    with pytest.raises(RuntimeError, match="Accept the license"):
+        ltx_engine.prepare(str(tmp_path / "m"), str(tmp_path / "w"), device="cpu", token=None)
+    assert not os.path.exists(str(tmp_path / "m"))

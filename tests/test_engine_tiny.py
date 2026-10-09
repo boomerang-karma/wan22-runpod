@@ -1,4 +1,5 @@
-"""Run the real engine code (load, LoRA fuse, encode, two-expert denoise, decode) on a tiny random Wan on CPU."""
+"""Run the real engine code (load, prompt encode, distilled sigmas, two-stage upsample, video + audio decode) on a
+tiny random LTX-2.x checkpoint on CPU."""
 import os
 import sys
 
@@ -10,59 +11,65 @@ from PIL import Image
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "worker"))
 sys.path.insert(0, os.path.dirname(__file__))
 
-import wan_engine  # noqa: E402
-from tiny_wan import LAYERS, build_tiny_model_dir, fake_lightning_lora, tiny_transformer  # noqa: E402
+import ltx_engine  # noqa: E402
+from tiny_ltx import build_tiny_model_dir  # noqa: E402
 
 
 @pytest.fixture(scope="module")
-def model_dir(tmp_path_factory):
-    return build_tiny_model_dir(str(tmp_path_factory.mktemp("tiny_wan")))
+def engine(tmp_path_factory):
+    model_dir = build_tiny_model_dir(str(tmp_path_factory.mktemp("tiny_ltx")))
+    return ltx_engine.LTXEngine(model_dir, device="cpu", memory_mode="resident", vae_tiling=False,
+                                dtype=torch.float32)
 
 
-@pytest.mark.parametrize("style", ["down_up_alpha", "down_up", "A_B"])
-def test_fuse_lightning_lora_changes_weights_and_removes_adapters(style):
-    model = tiny_transformer(1)
-    before = {k: v.clone() for k, v in model.state_dict().items()}
-    stats = wan_engine.fuse_lightning_lora(model, fake_lightning_lora(style=style), strength=1.0)
-    assert stats["lora_modules"] == 10 * LAYERS
-    assert stats["probe_max_abs_delta"] > 0
-    after = model.state_dict()
-    assert set(after) == set(before), "fused model must have the original keys only (no lora_A/lora_B left)"
-    changed = [k for k in before if not torch.equal(before[k], after[k])]
-    assert len(changed) == 10 * LAYERS                     # exactly the targeted linear weights moved
-    assert not any(hasattr(m, "lora_A") for m in model.modules())
+def _img():
+    return Image.fromarray((np.random.default_rng(0).random((64, 64, 3)) * 255).astype(np.uint8))
 
 
-def test_fuse_rejects_lora_that_matches_nothing():
-    bad = {k.replace("blocks.", "nonexistent_blocks."): v for k, v in fake_lightning_lora().items()}
-    with pytest.raises(Exception):
-        wan_engine.fuse_lightning_lora(tiny_transformer(1), bad, 1.0)
+def test_two_stage_generates_full_size_frames_and_audio(engine):
+    steps = []
+    frames, audio, sr, timings = engine.generate(_img(), "a cartoon hero runs with cake", width=64, height=64,
+                                                 num_frames=5, frame_rate=24.0, seed=7, progress=steps.append)
+    assert frames.dtype == np.uint8 and frames.shape == (5, 64, 64, 3)
+    assert audio.ndim == 2 and audio.shape[0] == 2 and audio.shape[1] > 0 and audio.dtype == np.float32
+    assert sr == 16000
+    n = len(ltx_engine.DISTILLED_SIGMA_VALUES) + len(ltx_engine.STAGE_2_DISTILLED_SIGMA_VALUES)
+    assert steps == [f"denoise step {i}/{n}" for i in range(1, n + 1)]          # 8 at half size + 3 at full size
+    assert {"encode_prompt_s", "stage1_s", "upsample_s", "stage2_and_decode_s"} <= set(timings)
 
 
-def test_engine_generates_uint8_frames_resident_mode_on_cpu(model_dir):
-    eng = wan_engine.WanEngine(model_dir, device="cpu", memory_mode="resident", dtype=torch.float32)
-    img = Image.fromarray((np.random.default_rng(0).random((48, 32, 3)) * 255).astype(np.uint8))
-    steps_seen = []
-    frames, timings = eng.generate(img, "a cartoon hero runs with cake", width=32, height=48, num_frames=9, steps=4,
-                                   seed=7, progress=steps_seen.append)
-    assert frames.dtype == np.uint8 and frames.shape == (9, 48, 32, 3)
-    assert steps_seen == [f"denoise step {i}/4" for i in range(1, 5)]
-    assert {"encode_prompt_s", "denoise_s", "vae_decode_s"} <= set(timings)
-    # deterministic for a fixed seed (CPU generator) and different for another seed
-    again, _ = eng.generate(img, "a cartoon hero runs with cake", width=32, height=48, num_frames=9, steps=4, seed=7)
-    other, _ = eng.generate(img, "a cartoon hero runs with cake", width=32, height=48, num_frames=9, steps=4, seed=8)
-    assert np.array_equal(frames, again) and not np.array_equal(frames, other)
+def test_single_stage_draft_and_seed_determinism(engine):
+    args = dict(width=64, height=64, num_frames=5, two_stage=False)
+    a, wav_a, _, timings = engine.generate(_img(), "balloons on a sunny patio", seed=3, **args)
+    b, wav_b, _, _ = engine.generate(_img(), "balloons on a sunny patio", seed=3, **args)
+    c, _, _, _ = engine.generate(_img(), "balloons on a sunny patio", seed=4, **args)
+    assert a.shape == (5, 64, 64, 3) and "denoise_and_decode_s" in timings
+    assert np.array_equal(a, b) and np.array_equal(wav_a, wav_b) and not np.array_equal(a, c)
 
 
-def test_both_experts_are_used_with_4_steps(model_dir, monkeypatch):
-    """boundary_ratio 0.9 + shift 5 + 4 steps must give the 2 high-noise / 2 low-noise split of the reference
-    ComfyUI Lightning workflow."""
-    eng = wan_engine.WanEngine(model_dir, device="cpu", memory_mode="resident", dtype=torch.float32)
-    calls = {"high": 0, "low": 0}
-    hi, lo = eng.pipe.transformer, eng.pipe.transformer_2
-    orig_hi, orig_lo = hi.forward, lo.forward
-    monkeypatch.setattr(hi, "forward", lambda *a, **k: (calls.__setitem__("high", calls["high"] + 1), orig_hi(*a, **k))[1])
-    monkeypatch.setattr(lo, "forward", lambda *a, **k: (calls.__setitem__("low", calls["low"] + 1), orig_lo(*a, **k))[1])
-    img = Image.new("RGB", (32, 48), (200, 120, 60))
-    eng.generate(img, "photo comes to life", width=32, height=48, num_frames=5, steps=4, seed=1)
-    assert calls == {"high": 2, "low": 2}, calls
+def test_prompt_encode_retries_with_transformer_parked_after_oom(engine, monkeypatch):
+    real, calls, moves = engine.pipe.encode_prompt, [], []
+    real_to = engine.pipe.transformer.to
+
+    def flaky(*a, **k):
+        if not (a and a[0]) and not k.get("prompt"):          # the pipeline's own call with pre-encoded embeds
+            return real(*a, **k)
+        calls.append(1)
+        if len(calls) == 1:
+            raise torch.OutOfMemoryError("CUDA out of memory (simulated)")
+        return real(*a, **k)
+
+    monkeypatch.setattr(engine.pipe, "encode_prompt", flaky)
+    monkeypatch.setattr(engine.pipe.transformer, "to", lambda d: (moves.append(str(d)), real_to(d))[1])
+    frames, _, _, _ = engine.generate(_img(), "photo comes to life", width=64, height=64, num_frames=5, seed=1,
+                                      two_stage=False)
+    assert len(calls) == 2 and moves == ["cpu", "cpu"] and frames.shape == (5, 64, 64, 3)   # parked, then restored
+
+
+def test_prompt_is_pre_encoded_so_text_encoder_can_stay_off_gpu(engine, monkeypatch):
+    """Resident mode encodes before the pipeline call; the pipeline must not run the text encoder again."""
+    calls = []
+    orig = engine.pipe.text_encoder.forward
+    monkeypatch.setattr(engine.pipe.text_encoder, "forward", lambda *a, **k: (calls.append(1), orig(*a, **k))[1])
+    engine.generate(_img(), "photo comes to life", width=64, height=64, num_frames=5, seed=1)
+    assert len(calls) == 1

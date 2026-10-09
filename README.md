@@ -1,79 +1,89 @@
-# wan22-runpod — Wan 2.2 image-to-video on RunPod Serverless
+# wan22-runpod — LTX-2.5 image-to-video (with audio) on RunPod Serverless
 
-Self-hosted image→video endpoint: **Wan 2.2 I2V A14B** (Apache-2.0) with the **Lightning 4-step** distill LoRA
-(lightx2v, Apache-2.0), packaged as a scale-to-zero RunPod serverless worker plus a small CLI (`wanctl.py`).
+Self-hosted image→video endpoint running **LTX-2.5** (Lightricks, Aug 2026; distilled checkpoint) as a scale-to-zero
+RunPod serverless worker, plus a small CLI (`wanctl.py`). Each clip comes with a **synchronized audio track**
+(48 kHz stereo, muxed into the mp4). The repo and CLI keep their original `wan22` names; the model is LTX-2.5.
+
+**License:** LTX-2.x Community License — free for commercial use by organisations under $10M annual revenue (see
+[the license](https://github.com/Lightricks/LTX-2/blob/main/LICENSE.md)). The weights are gated on Hugging Face.
 
 ## Status — what is verified and what is not
 
-| Verified here (CPU, `make test`, 27 tests) | Not verified (needs your first GPU run) |
+| Verified here (CPU, `make test`, 29 tests) | Not verified (needs your first GPU run) |
 |---|---|
-| Engine code runs end to end on a tiny random Wan 2.2 (load → encode → 2-expert denoise → decode) | Real 14B weights on a real GPU: speed, peak VRAM, quality |
-| 4 steps split 2 high-noise / 2 low-noise, as in the reference ComfyUI Lightning workflow | Docker image build (no Docker daemon in the build environment) |
-| `prepare()` orchestration: per-component download, bf16 cast, LoRA fuse, atomic save, idempotent re-run | Network-volume read speed → cold-start time |
-| LoRA key mapping onto all 400 target linears of the **full-size** A14B expert (meta device) | The exact Lightning LoRA file format (prepare fails loudly if it does not match) |
-| Handler request path through the RunPod SDK test runner (mock engine) → real H.264 mp4 | RunPod REST calls against the live API (payloads follow the published schema) |
-| Client payloads, dry-run deploy, key masking, cost maths | |
-
-The first `prepare` + one `generate` on RunPod is the integration test. Everything that can fail there reports
-a specific error rather than producing a silently bad model.
+| Engine runs end to end on a tiny random LTX-2 (load → encode → 8-step stage 1 → x2 latent upsample → 3-step stage 2 → video + audio decode) | Real 22B weights on a real GPU: speed, peak VRAM, quality |
+| Single-stage draft path, seed determinism, prompt pre-encoding, OOM fallback | Exact class names in the real `model_index.json` (gated; prepare reports a clear error if they differ) |
+| `prepare()`: per-component download, bf16 re-save, atomic save, idempotent re-run, clear error without HF access | Network-volume read speed → cold-start time |
+| Handler through the RunPod SDK test runner (mock engine) → real H.264 + AAC mp4 | |
+| Client payloads, dry-run deploy, key and token hygiene, cost maths | |
 
 ## How it works
 
 ```
 your Mac ── wanctl.py ──REST──▶ RunPod: network volume (1 DC) + template (image, env) + endpoint (GPU pool)
                     └──/run──▶ worker (scale-to-zero)
-                                 ├─ cold start: load fused bf16 model from /runpod-volume (~69 GB)
-                                 └─ job: image+prompt → 4 Euler steps → VAE decode → H.264 mp4 → base64 / S3 URL
+                                 ├─ cold start: load bf16 model from /runpod-volume (~72 GB)
+                                 └─ job: image+prompt → 8 steps @ half size → x2 upsample → 3 steps → video+audio → mp4
 ```
 
-* **prepare (once):** downloads `Wan-AI/Wan2.2-I2V-A14B-Diffusers` (126 GB, fp32 experts) one component at a time
-  through the container disk, casts to bf16, **fuses** the Lightning LoRA into each expert, and writes ~69 GB to the
-  network volume. Fusing once means no LoRA work on any cold start or request.
-* **generate:** both experts + VAE stay on the GPU ("resident", 80 GB cards); the 5.7B text encoder waits in host
-  RAM and visits the GPU only to encode the prompt. CFG = 1 (Lightning is CFG-distilled → one pass per step).
-* Output: 81 frames @ 16 fps (5.06 s), 720×1280 portrait by default (480×832 for cheap drafts).
+* **prepare (once):** downloads `Lightricks/LTX-2.5-Diffusers` (pinned revision) one component at a time through
+  the container disk, re-saves the fp32 distilled transformer and text connectors in bf16, and writes ~72 GB to the
+  network volume. Needs a Hugging Face token (below); the token is sent in the prepare job only and never stored.
+* **generate:** the distilled recipe from the model card: fixed sigma schedules, no guidance (one pass per step,
+  no negative prompt). Transformer, VAEs, vocoder and upsampler stay on the GPU; the 12B Gemma text encoder waits in
+  host RAM and visits the GPU only to encode the prompt.
+* Output: 121 frames @ 24 fps (5 s) by default, up to 20 s. Sizes (portrait shown; landscape inputs flip them):
+
+| `--resolution` | Size | Pipeline |
+|---|---|---|
+| `540p` | 544×960 | single-stage, 8 steps (cheap draft) |
+| `720p` (default) | 704×1280 | two-stage |
+| `1080p` | 1088×1920 | two-stage |
 
 ## Cost — estimates, not measurements
 
-From FLOP counts (≈6.8 PFLOP per 720p forward pass) and RunPod's listed serverless rates. Your first runs replace
-these numbers: every `generate` prints its billed seconds and estimated cost, and `wanctl.py costs` sums them.
+From FLOP counts for a ~19B-parameter transformer and RunPod's listed serverless rates (A100 80GB $2.72/h, H100
+$4.79/h). Your first runs replace these: every `generate` prints billed seconds and estimated cost, and
+`wanctl.py costs` sums them.
 
-| Item | A100 80GB ($2.72/h) | H100 80GB ($4.79/h) |
+| Item | A100 80GB | H100 80GB |
 |---|---|---|
-| 720p 5 s clip, warm worker | ~2.5–3.5 min ≈ **$0.12–0.16** | ~1.3–2 min ≈ **$0.10–0.16** |
-| 480p 5 s clip, warm worker | ≈ $0.03–0.05 | ≈ $0.03–0.05 |
-| Cold start (load ~69 GB from the volume) | +1–4 min per fresh worker | same |
-| `prepare`, once | ~30 min ≈ $1.4 | ≈ $2.4 |
+| 540p 5 s draft, warm worker | ~20–40 s ≈ **$0.02–0.03** | ≈ $0.02–0.03 |
+| 720p 5 s clip, warm worker | ~45–75 s ≈ **$0.03–0.06** | ≈ $0.03–0.05 |
+| 1080p 5 s clip, warm worker | ~1.5–2.5 min ≈ **$0.07–0.11** | ≈ $0.05–0.09 |
+| Cold start (load ~72 GB from the volume) | +2–5 min per fresh worker ≈ $0.10–0.25 | same time, ≈ $0.15–0.40 |
+| `prepare`, once | ~20–40 min ≈ $0.9–1.8 | ≈ $1.6–3.2 |
 | Network volume 100 GB | $7 / month while it exists | |
 
-Reference point: Higgsfield Kling 3.0 std ≈ 6.25 credits per 5 s ≈ $0.18–0.47 depending on plan. Self-hosting is
-cheaper per clip only when the worker is warm (batch your shots) and you keep using it; quality is open-model level.
+Longer clips cost more than linearly (attention). Batch shots back to back so they share one warm worker.
 
 ## Setup
 
-Prereqs: Python 3.10+, a RunPod account with credit, and somewhere to build the image (GitHub Actions or Docker
-buildx).
+Prereqs: Python 3.10+, a RunPod account with credit, a free Hugging Face account, and somewhere to build the image
+(GitHub Actions or Docker buildx).
 
 ```bash
 pip install -r requirements-client.txt
 python wanctl.py init                 # creates config.yaml (chmod 600, git-ignored)
-# edit config.yaml: runpod.api_key, runpod.data_center, image.name
+# edit config.yaml: runpod.data_center, image.name   (API key: export RUNPOD_API_KEY=... instead)
 python wanctl.py check                # validates the key (read-only)
 ```
 
-**1. Build the worker image** (either):
-* push this repo to GitHub → Actions → *build-worker* → Run (pushes `ghcr.io/<you>/wan22-runpod-worker:<tag>`), then
-  make the package public or add a RunPod registry auth (`image.registry_auth_id`); or
-* `make build` with Docker buildx (cross-builds linux/amd64 on Apple Silicon; slow but works).
+**Hugging Face access (once):** sign in, open https://huggingface.co/Lightricks/LTX-2.5-Diffusers and click
+*Agree and Access*; then create a **read** token at https://huggingface.co/settings/tokens.
 
-**2. Deploy** — creates the network volume, template and endpoint, and records their IDs in `.runpod_state.json`:
+**1. Build the worker image:** GitHub → Actions → *build-worker* → Run with a new tag (e.g. `0.2.0`) → put
+`ghcr.io/<you>/wan22-runpod-worker:<tag>` in `image.name`. Or `make build` with Docker buildx.
+
+**2. Deploy** (creates or updates the volume, template and endpoint; IDs go to `.runpod_state.json`):
 ```bash
-python wanctl.py deploy --dry-run     # see the exact payloads first
+python wanctl.py deploy --dry-run
 python wanctl.py deploy
 ```
 
 **3. Prepare the weights (once):**
 ```bash
+export HF_TOKEN=hf_...
 python wanctl.py prepare              # ~20-40 min; prints progress; safe to re-run
 python wanctl.py info                 # worker reports GPU, cold-start time, what it loaded
 ```
@@ -81,50 +91,54 @@ python wanctl.py info                 # worker reports GPU, cold-start time, wha
 **4. Generate:**
 ```bash
 python wanctl.py generate --image path/to/photo.png \
-  --prompt-file prompts/shot1_squad_arrives.txt --seed 7 --resolution 480p      # cheap draft
+  --prompt-file prompts/shot1_squad_arrives.txt --seed 7 --resolution 540p      # cheap draft
 python wanctl.py generate --image path/to/photo.png \
-  --prompt-file prompts/shot1_squad_arrives.txt --seed 7                        # final at 720p, same seed
+  --prompt-file prompts/shot1_squad_arrives.txt --seed 7                        # 720p final
 ```
-Each run writes `outputs/<name>.mp4` plus a `.json` with the prompt, seed, timings, and estimated cost. Submit several
-shots back to back so they share one warm worker (idle timeout is 5 s by default; raise `endpoint.idle_timeout_s`
-to ~60 while iterating, then lower it again).
+Each run writes `outputs/<name>.mp4` plus a `.json` with the prompt, seed, timings and estimated cost. A draft and
+the final with the same seed are similar but not identical (different pipelines). Raise `endpoint.idle_timeout_s`
+to ~60 while iterating so consecutive shots reuse the warm worker, then lower it again.
+
+**Prompting:** LTX-2.5 was trained on long single-paragraph captions that describe the shot, motion, light **and
+sound**. Add what should be heard (laughter, wind, a birthday song hummed, footsteps); short prompts degrade quality.
 
 **5. Tear down** when finished:
 ```bash
 python wanctl.py teardown             # endpoint + template; keeps the prepared volume ($7/month)
-python wanctl.py teardown --volume    # also deletes the weights (re-prepare costs ~$1.5-2.5)
+python wanctl.py teardown --volume    # also deletes the weights (re-prepare costs ~$1-3)
 ```
 
 ## Knobs
 
 | Where | Setting | Effect |
 |---|---|---|
-| `generate` | `--resolution 480p` | ~4× cheaper drafts; use the same seed for the 720p final |
-| `generate` | `--flow-shift 8` | try if motion looks mushy (reference workflow uses 5) |
-| `generate` | `--guidance 3.5` + `--negative-file` | enables a negative-prompt pass; 2× slower; Lightning is tuned for 1.0 |
-| `generate` | `--num-frames 49` | shorter clip (must be 4k+1); 81 is the trained length |
-| `worker_env` | `MEMORY_MODE: offload` | lets 48 GB GPUs (L40S/A6000) work if the host has ~75 GB RAM; slower |
-| `worker_env` | `VAE_TILING: "1"` | lower decode VRAM |
-| `worker_env` | `LORA_STRENGTH_*` | baked in at prepare time → re-run `prepare --force` after changing |
+| `generate` | `--resolution 540p\|720p\|1080p` | draft / default / high quality |
+| `generate` | `--num-frames 241` | 10 s at 24 fps; must be 8k+1, max 20 s |
+| `generate` | `--no-audio` | silent mp4 |
+| `generate` | `--fps 25` | frame rate the model generates for (12–50) |
+| `worker_env` | `MEMORY_MODE: offload` | lets 48 GB GPUs work if the host has ~80 GB RAM; slower |
+| `worker_env` | `VAE_TILING: "0"` | slightly faster decode at 540p/720p; keep "1" for 1080p |
+| `worker_env` | `LTX_REVISION` | pin a different Hugging Face commit (then `prepare --force`) |
 | `worker_env` | `BUCKET_*` | upload videos > 8 MB (base64) to S3/R2 and return a link instead of inline |
 
 ## Troubleshooting
 
+* **`prepare` says Hugging Face refused access:** accept the license on the model page with the same account that
+  created the token, then `export HF_TOKEN=...` and re-run.
 * **Jobs sit IN_QUEUE / no workers start:** no listed GPU free in your data center. Add GPU types or move to a DC
   with availability (a network volume cannot move; create a new one there and re-prepare).
+* **CUDA out of memory:** use an H200 (in the GPU list) or set `MEMORY_MODE: offload`. Prompt encoding already
+  retries with the transformer parked in host RAM.
 * **Worker fails to start with a CUDA error:** host driver older than the image's CUDA. Keep
   `endpoint.min_cuda_version` matched to the torch build (see `worker/Dockerfile`).
-* **CUDA out of memory:** use H100/A100 80 GB, set `VAE_TILING: "1"`, or `MEMORY_MODE: offload`.
-* **`prepare` says the LoRA matched too few modules:** the LoRA file layout changed upstream; pin `LORA_REVISION` /
-  `WAN_REVISION` in `worker_env` to known commits.
-* **Faces drift:** expected with any image-to-video model over 5 s. Keep faces still and small in frame, or cut away.
+* **Faces drift:** expected with any image-to-video model; keep faces still and small in frame, or cut away.
 
 ## Security
 
-* `config.yaml` and `.runpod_state.json` are git-ignored and created with mode 600. `RUNPOD_API_KEY` in the
-  environment overrides the file — prefer it in CI.
-* The key is sent only to `rest.runpod.io` and `api.runpod.ai`, and it is never printed. `--dry-run` masks bucket secrets.
-* Bucket credentials go into the RunPod template env, which RunPod stores. Use a bucket-scoped key.
+* `config.yaml` and `.runpod_state.json` are git-ignored and created with mode 600. `RUNPOD_API_KEY` and `HF_TOKEN`
+  in the environment are preferred over the file.
+* The RunPod key is sent only to `rest.runpod.io` and `api.runpod.ai`; the HF token only inside the prepare job.
+  Neither is printed or written to the volume. `--dry-run` masks bucket secrets.
 * Input images are sent to RunPod as base64 in the job payload. Async job results stay retrievable for 30 minutes.
 
 ## Layout
@@ -132,10 +146,10 @@ python wanctl.py teardown --volume    # also deletes the weights (re-prepare cos
 ```
 wanctl.py                CLI: init | check | deploy | prepare | info | generate | health | costs | teardown
 config.example.yaml      everything configurable; copy to config.yaml
-worker/handler.py        RunPod entry: actions, input validation, mp4 encode, inline/S3 output
-worker/wan_engine.py     prepare() + WanEngine (diffusers)
+worker/handler.py        RunPod entry: actions, input validation, mp4 + AAC encode, inline/S3 output
+worker/ltx_engine.py     prepare() + LTXEngine (diffusers LTX2ImageToVideoPipeline, two-stage distilled)
 worker/mock_engine.py    CPU stand-in for local tests
 worker/Dockerfile        python:3.12-slim + torch 2.14.1 (CUDA 13.0) + pinned diffusers stack
-prompts/                 the two Birthday Squad shots + negative prompt
+prompts/                 the two Birthday Squad shots + negative prompt (unused by the distilled model)
 tests/                   CPU test suite (make test)
 ```

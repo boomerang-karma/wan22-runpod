@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
-"""wanctl: deploy and drive the Wan 2.2 image-to-video RunPod serverless endpoint.
+"""wanctl: deploy and drive the LTX-2.5 image-to-video (+ audio) RunPod serverless endpoint.
 
   python wanctl.py init                  create config.yaml from the example (chmod 600) — then add your API key
   python wanctl.py check                 validate config and that the API key works (read-only)
   python wanctl.py deploy [--dry-run]    create/update network volume, template, endpoint (idempotent)
-  python wanctl.py prepare               one-time: download + fuse weights onto the volume (~20-40 min of GPU time)
+  python wanctl.py prepare               one-time: download weights onto the volume (needs HF_TOKEN; ~20-40 min)
   python wanctl.py info                  ask a worker what it has loaded (spins up a worker: billed)
-  python wanctl.py generate --image IMG --prompt-file P [--seed N] [--resolution 480p|720p] [--out F]
+  python wanctl.py generate --image IMG --prompt-file P [--seed N] [--resolution 540p|720p|1080p] [--out F]
   python wanctl.py health                queue / worker counts (free)
   python wanctl.py costs                 sum estimated cost of jobs saved in outputs/
   python wanctl.py teardown [--volume] [--yes]
@@ -36,7 +36,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 REST = "https://rest.runpod.io/v1"
 SERVERLESS = "https://api.runpod.ai/v2"
 STATE_FILE = os.path.join(HERE, ".runpod_state.json")
-RESOLUTIONS = {"480p": (480, 832), "720p": (720, 1280)}          # must match worker/handler.py
+RESOLUTIONS = {"540p": (544, 960), "720p": (704, 1280), "1080p": (1088, 1920)}   # must match worker/handler.py
 SECRET_ENV = ("BUCKET_SECRET_ACCESS_KEY", "BUCKET_ACCESS_KEY_ID", "HF_TOKEN")
 TERMINAL = ("COMPLETED", "FAILED", "CANCELLED", "TIMED_OUT")
 
@@ -262,12 +262,23 @@ def run_job(rp: RunPod, ep: str, payload: dict, poll_s: float, quiet: bool = Fal
         time.sleep(poll_s)
 
 
+def hf_token(cfg: dict) -> str:
+    token = os.getenv("HF_TOKEN") or (cfg.get("worker_env") or {}).get("HF_TOKEN") or ""
+    if not token.strip():
+        raise CtlError("no Hugging Face token. The LTX-2.5 weights are gated:\n"
+                       "  1. sign in at https://huggingface.co/Lightricks/LTX-2.5-Diffusers and accept the license\n"
+                       "  2. create a read token at https://huggingface.co/settings/tokens\n"
+                       "  3. export HF_TOKEN=hf_... and run prepare again")
+    return token.strip()
+
+
 def cmd_prepare(args) -> None:
     cfg = load_config(args.config)
     rp, ep = RunPod(api_key(cfg)), _endpoint_id(cfg)
-    print("Preparing weights on the network volume. This downloads ~126 GB and fuses the LoRA on a GPU worker;\n"
-          "expect roughly 20-40 minutes of billed GPU time once. Safe to re-run (it skips if already prepared).")
-    st = run_job(rp, ep, {"input": {"action": "prepare", "force": args.force},
+    token = hf_token(cfg)
+    print("Preparing weights on the network volume. This downloads ~115 GB from Hugging Face on a GPU worker and\n"
+          "writes ~72 GB; expect roughly 20-40 minutes of billed GPU time once. Safe to re-run (skips if prepared).")
+    st = run_job(rp, ep, {"input": {"action": "prepare", "force": args.force, "hf_token": token},
                           "policy": {"executionTimeout": int(args.timeout_min) * 60 * 1000}}, poll_s=20)
     print(json.dumps(st.get("output") or st.get("error"), indent=2))
     if st.get("status") != "COMPLETED":
@@ -320,27 +331,23 @@ def cmd_generate(args) -> None:
     prompt = args.prompt or (open(args.prompt_file).read().strip() if args.prompt_file else "")
     if not prompt:
         raise CtlError("give --prompt or --prompt-file")
-    negative = args.negative or (open(args.negative_file).read().strip() if args.negative_file else "")
     resolution = args.resolution or d.get("resolution", "720p")
     img_b64, (w, h) = encode_image(args.image, resolution)
-    inp = {"action": "generate", "image_base64": img_b64, "prompt": prompt, "negative_prompt": negative,
-           "width": w, "height": h,
-           "num_frames": args.num_frames or d.get("num_frames", 81), "steps": args.steps or d.get("steps", 4),
-           "flow_shift": args.flow_shift or d.get("flow_shift", 5.0), "fps": args.fps or d.get("fps", 16),
-           "crf": args.crf or d.get("crf", 19)}
+    inp = {"action": "generate", "image_base64": img_b64, "prompt": prompt, "resolution": resolution,
+           "num_frames": args.num_frames or d.get("num_frames", 121), "fps": args.fps or d.get("fps", 24),
+           "crf": args.crf or d.get("crf", 19), "audio": not args.no_audio}
     if args.seed is not None:
         inp["seed"] = args.seed
-    if args.guidance is not None:
-        inp["guidance_scale"] = args.guidance
     timeout_ms = int(args.timeout_s or d.get("timeout_s", 900)) * 1000
-    print(f"generating {w}x{h}, {inp['num_frames']} frames, {inp['steps']} steps from {os.path.basename(args.image)}")
+    print(f"generating {w}x{h}, {inp['num_frames']} frames @ {inp['fps']} fps "
+          f"({inp['num_frames'] / inp['fps']:.1f} s{', with audio' if inp['audio'] else ''}) from {os.path.basename(args.image)}")
     st = run_job(rp, ep, {"input": inp, "policy": {"executionTimeout": timeout_ms}}, poll_s=4)
     out = st.get("output") or {}
     if st.get("status") != "COMPLETED" or "error" in out:
         raise CtlError(f"job {st.get('id')} {st.get('status')}: {out.get('error') or st.get('error')}")
 
     os.makedirs(cfg.get("output_dir", "outputs"), exist_ok=True)
-    stem = args.out or os.path.join(cfg.get("output_dir", "outputs"), f"wan_{time.strftime('%Y%m%d_%H%M%S')}_s{out['seed']}.mp4")
+    stem = args.out or os.path.join(cfg.get("output_dir", "outputs"), f"ltx_{time.strftime('%Y%m%d_%H%M%S')}_s{out['seed']}.mp4")
     if "video_base64" in out:
         with open(stem, "wb") as f:
             f.write(base64.b64decode(out.pop("video_base64")))
@@ -352,13 +359,13 @@ def cmd_generate(args) -> None:
         raise CtlError("job returned no video")
     cost = estimate_cost(cfg, out, st.get("executionTime"))
     meta = {"job_id": st.get("id"), "delay_ms": st.get("delayTime"), "execution_ms": st.get("executionTime"),
-            "wall_s": st.get("_wall_s"), "prompt": prompt, "negative_prompt": negative, "image": os.path.abspath(args.image),
+            "wall_s": st.get("_wall_s"), "prompt": prompt, "image": os.path.abspath(args.image),
             "result": out, "cost": cost}
     with open(os.path.splitext(stem)[0] + ".json", "w") as f:
         json.dump(meta, f, indent=2)
     t = out.get("timings", {})
     print(f"\nsaved {stem}\n  seed {out['seed']} | gpu {out.get('gpu')} | queue+start {st.get('delayTime', 0) / 1000:.1f}s | "
-          f"execution {st.get('executionTime', 0) / 1000:.1f}s | denoise {t.get('denoise_s')}s | decode {t.get('vae_decode_s')}s")
+          f"execution {st.get('executionTime', 0) / 1000:.1f}s")
     if cost["usd_est"] is not None:
         print(f"  est. cost ${cost['usd_est']:.3f} ({cost['billed_s_est']}s @ ${cost['usd_per_hour']}/h"
               f"{', incl. cold start' if cost['cold_start_s'] else ''})")
@@ -381,7 +388,7 @@ def cmd_teardown(args) -> None:
     rp, st = RunPod(api_key(cfg)), load_state()
     what = [f"endpoint {st.get('endpoint_id')}", f"template {st.get('template_id')}"]
     if args.volume:
-        what.append(f"network volume {st.get('volume_id')} (deletes the prepared ~69 GB model; re-prepare costs GPU time)")
+        what.append(f"network volume {st.get('volume_id')} (deletes the prepared ~72 GB model; re-prepare costs GPU time)")
     if not args.yes:
         print("will delete:\n  " + "\n  ".join(what))
         if input("type 'delete' to confirm: ").strip() != "delete":
@@ -422,15 +429,11 @@ def main(argv=None) -> int:
     p.add_argument("--image", required=True)
     p.add_argument("--prompt")
     p.add_argument("--prompt-file")
-    p.add_argument("--negative")
-    p.add_argument("--negative-file")
     p.add_argument("--seed", type=int)
-    p.add_argument("--resolution", choices=sorted(RESOLUTIONS))
-    p.add_argument("--num-frames", type=int)
-    p.add_argument("--steps", type=int)
-    p.add_argument("--flow-shift", type=float)
-    p.add_argument("--guidance", type=float, help=">1 enables a negative-prompt pass (2x slower; Lightning expects 1)")
+    p.add_argument("--resolution", choices=sorted(RESOLUTIONS), help="540p = single-stage draft; 720p/1080p two-stage")
+    p.add_argument("--num-frames", type=int, help="8k+1, e.g. 121 = 5 s at 24 fps; up to 20 s")
     p.add_argument("--fps", type=int)
+    p.add_argument("--no-audio", action="store_true", help="return a silent mp4")
     p.add_argument("--crf", type=int)
     p.add_argument("--timeout-s", type=int)
     p.add_argument("--out")

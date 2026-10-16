@@ -90,24 +90,24 @@ def _int(inp: dict, key: str, default: int, lo: int, hi: int) -> int:
     return v
 
 
-def _read_image(inp: dict) -> Image.Image:
-    if inp.get("image_base64"):
-        data = inp["image_base64"]
+def _read_image(inp: dict, key: str = "image") -> Image.Image:
+    if inp.get(f"{key}_base64"):
+        data = inp[f"{key}_base64"]
         if data.startswith("data:"):
             data = data.split(",", 1)[-1]
         try:
             raw = base64.b64decode(data, validate=True)
         except (binascii.Error, ValueError):
-            raise BadInput("'image_base64' is not valid base64")
-    elif inp.get("image_url"):
-        url = inp["image_url"]
+            raise BadInput(f"'{key}_base64' is not valid base64")
+    elif inp.get(f"{key}_url"):
+        url = inp[f"{key}_url"]
         if not url.startswith(("https://", "http://")):
-            raise BadInput("'image_url' must be http(s)")
+            raise BadInput(f"'{key}_url' must be http(s)")
         req = urllib.request.Request(url, headers={"User-Agent": "ltx25-runpod-worker"})
         with urllib.request.urlopen(req, timeout=30) as r:
             raw = r.read(MAX_IMAGE_MB * 2**20 + 1)
     else:
-        raise BadInput("provide 'image_base64' or 'image_url'")
+        raise BadInput(f"provide '{key}_base64' or '{key}_url'")
     if len(raw) > MAX_IMAGE_MB * 2**20:
         raise BadInput(f"image larger than {MAX_IMAGE_MB} MB")
     try:
@@ -161,8 +161,16 @@ def parse(inp: dict) -> dict:
         raise BadInput(f"clip is {nf / fps:.1f} s; the model supports up to {MAX_SECONDS:.0f} s (num_frames / fps)")
     seed = inp.get("seed")
     seed = random.randint(0, 2**31 - 1) if seed is None else _int(inp, "seed", 0, 0, 2**31 - 1)
+    # end frame: `loop: true` returns to the input image; `end_image_base64`/`end_image_url` to another image
+    image = _cover(img, w, h)
+    if _bool(inp, "loop", False):
+        end, end_kind = image, "loop"
+    elif inp.get("end_image_base64") or inp.get("end_image_url"):
+        end, end_kind = _cover(_read_image(inp, "end_image"), w, h), "image"
+    else:
+        end, end_kind = None, None
     return {
-        "image": _cover(img, w, h), "prompt": prompt, "width": w, "height": h, "two_stage": two_stage,
+        "image": image, "end_image": end, "end_frame": end_kind, "prompt": prompt, "width": w, "height": h, "two_stage": two_stage,
         "num_frames": nf, "fps": fps, "seed": seed, "audio": _bool(inp, "audio", True),
         "crf": _int(inp, "crf", 19, 10, 35),
     }
@@ -243,7 +251,7 @@ def do_generate(job: dict, inp: dict) -> dict:
 
     frames, audio, sample_rate, timings = ENGINE.generate(
         p["image"], p["prompt"], p["width"], p["height"], num_frames=p["num_frames"], frame_rate=float(p["fps"]),
-        seed=p["seed"], two_stage=p["two_stage"], progress=lambda m: _progress(job, m))
+        seed=p["seed"], two_stage=p["two_stage"], end_image=p["end_image"], progress=lambda m: _progress(job, m))
 
     t = time.time()
     video = encode_mp4(frames, p["fps"], p["crf"], audio if p["audio"] else None, sample_rate)
@@ -254,7 +262,7 @@ def do_generate(job: dict, inp: dict) -> dict:
         _FIRST_JOB = False
 
     out = {"seed": p["seed"], "width": p["width"], "height": p["height"], "num_frames": p["num_frames"],
-           "fps": p["fps"], "two_stage": p["two_stage"], "audio": p["audio"] and audio is not None,
+           "fps": p["fps"], "two_stage": p["two_stage"], "end_frame": p["end_frame"], "audio": p["audio"] and audio is not None,
            "gpu": ENGINE.gpu, "memory_mode": ENGINE.memory_mode, "video_bytes": len(video), "timings": timings}
     b64_mb = len(video) * 4 / 3 / 2**20
     if b64_mb <= INLINE_LIMIT_MB:

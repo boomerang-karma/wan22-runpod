@@ -39,6 +39,15 @@ STATE_FILE = os.path.join(HERE, ".runpod_state.json")
 RESOLUTIONS = {"540p": (544, 960), "720p": (704, 1280), "1080p": (1088, 1920)}   # must match worker/handler.py
 SECRET_ENV = ("BUCKET_SECRET_ACCESS_KEY", "BUCKET_ACCESS_KEY_ID", "HF_TOKEN")
 TERMINAL = ("COMPLETED", "FAILED", "CANCELLED", "TIMED_OUT")
+# Data centers where RunPod serverless workers may run (POST /endpoints enum, Oct 2026). Network volumes exist in more
+# places (e.g. US-NE-1, US-CO-1) but an endpoint cannot use those.
+SERVERLESS_DCS = {"AP-IN-1", "AP-JP-1", "CA-MTL-1", "CA-MTL-2", "CA-MTL-3", "EU-CZ-1", "EU-FR-1", "EU-NL-1", "EU-RO-1",
+                  "EU-SE-1", "EUR-IS-1", "EUR-IS-2", "EUR-IS-3", "EUR-NO-1", "OC-AU-1", "US-CA-2", "US-DE-1", "US-GA-1",
+                  "US-GA-2", "US-IL-1", "US-KS-2", "US-KS-3", "US-MD-1", "US-MO-1", "US-MO-2", "US-NC-1", "US-TX-1",
+                  "US-TX-3", "US-TX-4", "US-WA-1"}
+# Cards used only for the one-time download in each region (no model is loaded; any small GPU works).
+PREPARE_GPUS = ["NVIDIA RTX A5000", "NVIDIA RTX A4000", "NVIDIA L4", "NVIDIA GeForce RTX 4090", "NVIDIA RTX A6000",
+                "NVIDIA A40", "NVIDIA L40S", "NVIDIA GeForce RTX 3090", "NVIDIA RTX 4000 Ada Generation"]
 
 
 class CtlError(RuntimeError):
@@ -135,29 +144,73 @@ def template_payload(cfg: dict) -> dict:
     return body
 
 
-def endpoint_payload(cfg: dict, template_id: str, volume_id: str) -> dict:
+def data_centers(cfg: dict) -> list[str]:
+    """runpod.data_centers (list, first = primary) or the older single runpod.data_center."""
+    r = cfg.get("runpod") or {}
+    dcs = list(r.get("data_centers") or ([r["data_center"]] if r.get("data_center") else []))
+    return list(dict.fromkeys(dcs))
+
+
+def endpoint_payload(cfg: dict, template_id: str, volumes: dict[str, str]) -> dict:
+    """`volumes` maps data center -> network volume id; workers may start in any of these data centers."""
     e = cfg["endpoint"]
+    dcs = list(volumes)
     body = {"name": e["name"], "templateId": template_id, "computeType": "GPU", "gpuTypeIds": list(e["gpu_types"]),
-            "gpuCount": 1, "networkVolumeId": volume_id, "dataCenterIds": [cfg["runpod"]["data_center"]],
+            "gpuCount": 1, "networkVolumeId": volumes[dcs[0]], "dataCenterIds": dcs,
             "workersMin": int(e.get("workers_min", 0)), "workersMax": int(e.get("workers_max", 1)),
             "idleTimeout": int(e.get("idle_timeout_s", 5)),
             "executionTimeoutMs": int(e.get("execution_timeout_s", 900)) * 1000,
             "flashboot": bool(e.get("flashboot", True)), "scalerType": "QUEUE_DELAY", "scalerValue": 4}
+    if len(dcs) > 1:
+        body["networkVolumeIds"] = [volumes[dc] for dc in dcs]          # multi-region: one volume per data center
     if e.get("min_cuda_version"):
         body["minCudaVersion"] = str(e["min_cuda_version"])
     return body
 
 
+def prepare_endpoint_payload(cfg: dict, template_id: str, dc: str, volume_id: str) -> dict:
+    """Temporary single-region endpoint used only to fill one volume. Downloading needs no big GPU, so it takes
+    whatever small card is free (cheaper, and much easier to get than an 80 GB one)."""
+    body = endpoint_payload(cfg, template_id, {dc: volume_id})
+    body.update({"name": f"{cfg['endpoint']['name']}-prep-{dc}", "workersMax": 1, "idleTimeout": 5,
+                 "gpuTypeIds": list(cfg["endpoint"].get("prepare_gpu_types") or PREPARE_GPUS),
+                 "executionTimeoutMs": 2 * 3600 * 1000, "flashboot": False})
+    return body
+
+
 def validate(cfg: dict, need_image: bool = True) -> None:
     problems = []
-    if not (cfg.get("runpod") or {}).get("data_center"):
-        problems.append("runpod.data_center is empty")
+    if not data_centers(cfg):
+        problems.append("runpod.data_centers is empty")
+    bad = [dc for dc in data_centers(cfg) if dc not in SERVERLESS_DCS]
+    if bad:
+        problems.append(f"{', '.join(bad)} cannot run serverless workers (allowed: {', '.join(sorted(SERVERLESS_DCS))})")
     if need_image and not (cfg.get("image") or {}).get("name"):
         problems.append("image.name is empty (build and push worker/ first)")
     if not (cfg.get("endpoint") or {}).get("gpu_types"):
         problems.append("endpoint.gpu_types is empty")
     if problems:
         raise CtlError("config.yaml: " + "; ".join(problems))
+
+
+def _volumes_state(st: dict) -> dict:
+    """Migrate the single-volume state ({volume_id, data_center}) to {volumes: {dc: id}, prepared: [dc]}."""
+    if "volumes" not in st:
+        st["volumes"] = {st["data_center"]: st["volume_id"]} if st.get("volume_id") and st.get("data_center") else {}
+        st["prepared"] = list(st["volumes"])         # the old single-region flow served (and prepared) only this one
+    st.pop("volume_id", None)
+    return st
+
+
+def serving_volumes(cfg: dict, st: dict) -> dict:
+    """Data centers the main endpoint may use: only prepared ones, so no worker starts next to an empty volume.
+    Before anything is prepared (first deploy), the primary data center alone."""
+    vols = st.get("volumes") or {}
+    ready = {dc: vols[dc] for dc in data_centers(cfg) if dc in vols and dc in (st.get("prepared") or [])}
+    if ready:
+        return ready
+    first = data_centers(cfg)[0]
+    return {first: vols[first]} if first in vols else {}
 
 
 # ----------------------------------------------------------------------------------------------- commands
@@ -168,7 +221,7 @@ def cmd_init(args) -> None:
         return
     shutil.copy(os.path.join(HERE, "config.example.yaml"), dst)
     os.chmod(dst, 0o600)
-    print(f"created {dst} (mode 600). Fill in runpod.api_key, runpod.data_center and image.name.")
+    print(f"created {dst} (mode 600). Fill in runpod.api_key, runpod.data_centers and image.name.")
 
 
 def cmd_check(args) -> None:
@@ -191,23 +244,26 @@ def cmd_deploy(args) -> None:
     cfg = load_config(args.config)
     validate(cfg)
     rp = RunPod(api_key(cfg), dry_run=args.dry_run)
-    st = load_state()
+    st = _volumes_state(load_state())
 
-    # 1. network volume
-    vol_id = cfg["network_volume"].get("id") or st.get("volume_id")
-    if vol_id and not args.dry_run:
-        vol = rp.rest("GET", f"/networkvolumes/{vol_id}", ok404=True)
-        if not vol:
-            raise CtlError(f"network volume {vol_id} not found")
-        if vol.get("dataCenterId") != cfg["runpod"]["data_center"]:
-            raise CtlError(f"volume {vol_id} is in {vol.get('dataCenterId')}, config says {cfg['runpod']['data_center']}")
-        print(f"volume: reusing {vol_id} ({vol.get('size')} GB, {vol.get('dataCenterId')})")
-    if not vol_id:
-        vol = rp.rest("POST", "/networkvolumes", {"name": cfg["network_volume"]["name"],
-                                                  "size": int(cfg["network_volume"]["size_gb"]),
-                                                  "dataCenterId": cfg["runpod"]["data_center"]})
-        vol_id = vol["id"]
-        print(f"volume: created {vol_id}")
+    # 1. one network volume per data center (a volume, and the model on it, can only serve its own data center)
+    for dc in data_centers(cfg):
+        vol_id = st["volumes"].get(dc) or (cfg["network_volume"].get("id") if dc == data_centers(cfg)[0] else None)
+        if vol_id and not args.dry_run:
+            vol = rp.rest("GET", f"/networkvolumes/{vol_id}", ok404=True)
+            if not vol:
+                raise CtlError(f"network volume {vol_id} ({dc}) not found")
+            if vol.get("dataCenterId") != dc:
+                raise CtlError(f"volume {vol_id} is in {vol.get('dataCenterId')}, expected {dc}")
+            print(f"volume {dc}: reusing {vol_id} ({vol.get('size')} GB)"
+                  + ("" if dc in st.get("prepared", []) else " — not prepared yet"))
+        if not vol_id:
+            vol = rp.rest("POST", "/networkvolumes", {"name": f"{cfg['network_volume']['name']}-{dc.lower()}",
+                                                      "size": int(cfg["network_volume"]["size_gb"]),
+                                                      "dataCenterId": dc})
+            vol_id = vol["id"]
+            print(f"volume {dc}: created {vol_id} — run `python wanctl.py prepare` to fill it")
+        st["volumes"][dc] = vol_id
 
     # 2. template (PATCH triggers a rolling release of the endpoint's workers)
     tpl = template_payload(cfg)
@@ -218,22 +274,28 @@ def cmd_deploy(args) -> None:
     else:
         tpl_id = rp.rest("POST", "/templates", tpl)["id"]
         print(f"template: created {tpl_id}")
+    st["template_id"] = tpl_id
 
-    # 3. endpoint
-    ep = endpoint_payload(cfg, tpl_id, vol_id)
+    # 3. endpoint, limited to data centers whose volume holds the model
+    ep_id = _update_endpoint(rp, cfg, st)
+    if not args.dry_run:
+        st.update({"endpoint_id": ep_id, "image": cfg["image"]["name"]})
+        save_state(st)
+        todo = [dc for dc in data_centers(cfg) if dc not in st.get("prepared", [])]
+        print(f"\nsaved {os.path.basename(STATE_FILE)}." + (f" Next: python wanctl.py prepare  ({', '.join(todo)})"
+                                                             if todo else ""))
+
+
+def _update_endpoint(rp: RunPod, cfg: dict, st: dict) -> str:
+    ep = endpoint_payload(cfg, st["template_id"], serving_volumes(cfg, st))
     ep_id = st.get("endpoint_id")
     if ep_id:
         rp.rest("PATCH", f"/endpoints/{ep_id}", {k: v for k, v in ep.items() if k != "computeType"})
-        print(f"endpoint: updated {ep_id}")
+        print(f"endpoint: updated {ep_id} (data centers: {', '.join(ep['dataCenterIds'])})")
     else:
         ep_id = rp.rest("POST", "/endpoints", ep)["id"]
-        print(f"endpoint: created {ep_id}")
-
-    if not args.dry_run:
-        st.update({"volume_id": vol_id, "template_id": tpl_id, "endpoint_id": ep_id,
-                   "data_center": cfg["runpod"]["data_center"], "image": cfg["image"]["name"]})
-        save_state(st)
-        print(f"\nsaved {os.path.basename(STATE_FILE)}. Next: python wanctl.py prepare")
+        print(f"endpoint: created {ep_id} (data centers: {', '.join(ep['dataCenterIds'])})")
+    return ep_id
 
 
 def _endpoint_id(cfg: dict) -> str:
@@ -243,10 +305,10 @@ def _endpoint_id(cfg: dict) -> str:
     return ep
 
 
-def run_job(rp: RunPod, ep: str, payload: dict, poll_s: float, quiet: bool = False) -> dict:
+def run_job(rp: RunPod, ep: str, payload: dict, poll_s: float, quiet: bool = False, label: str = "") -> dict:
     job = rp.sls("POST", ep, "/run", payload)
     jid = job["id"]
-    print(f"job {jid} submitted")
+    print(f"{label}job {jid} submitted", flush=True)
     last, t0 = None, time.time()
     while True:
         st = rp.sls("GET", ep, f"/status/{jid}")
@@ -254,7 +316,7 @@ def run_job(rp: RunPod, ep: str, payload: dict, poll_s: float, quiet: bool = Fal
         note = st.get("output") if status == "IN_PROGRESS" and isinstance(st.get("output"), (str, dict)) else None
         line = f"{status}" + (f" — {note}" if note else "")
         if line != last and not quiet:
-            print(f"  [{time.time() - t0:6.0f}s] {line}")
+            print(f"{label}  [{time.time() - t0:6.0f}s] {line}", flush=True)
             last = line
         if status in TERMINAL:
             st["_wall_s"] = round(time.time() - t0, 1)
@@ -272,17 +334,58 @@ def hf_token(cfg: dict) -> str:
     return token.strip()
 
 
+def _prepare_one(rp: RunPod, cfg: dict, st: dict, dc: str, token: str, args) -> dict:
+    """Fill one region's volume through a temporary endpoint pinned to it, then delete that endpoint."""
+    label = f"[{dc}] "
+    ep_id = rp.rest("POST", "/endpoints", prepare_endpoint_payload(cfg, st["template_id"], dc, st["volumes"][dc]))["id"]
+    print(f"{label}temporary prepare endpoint {ep_id}", flush=True)
+    try:
+        return run_job(rp, ep_id, {"input": {"action": "prepare", "force": args.force, "hf_token": token},
+                                   "policy": {"executionTimeout": int(args.timeout_min) * 60 * 1000}},
+                       poll_s=20, label=label)
+    finally:
+        rp.rest("PATCH", f"/endpoints/{ep_id}", {"workersMin": 0, "workersMax": 0})
+        rp.rest("DELETE", f"/endpoints/{ep_id}", ok404=True)
+        print(f"{label}temporary endpoint deleted", flush=True)
+
+
 def cmd_prepare(args) -> None:
+    import concurrent.futures
     cfg = load_config(args.config)
-    rp, ep = RunPod(api_key(cfg)), _endpoint_id(cfg)
+    rp, st = RunPod(api_key(cfg)), _volumes_state(load_state())
     token = hf_token(cfg)
-    print("Preparing weights on the network volume. This downloads ~71 GB from Hugging Face on a GPU worker\n"
-          "(about 8 minutes of billed GPU time once, plus any wait for a free GPU). Safe to re-run (skips if prepared).")
-    st = run_job(rp, ep, {"input": {"action": "prepare", "force": args.force, "hf_token": token},
-                          "policy": {"executionTimeout": int(args.timeout_min) * 60 * 1000}}, poll_s=20)
-    print(json.dumps(st.get("output") or st.get("error"), indent=2))
-    if st.get("status") != "COMPLETED":
-        raise CtlError(f"prepare ended with {st.get('status')}")
+    if not st.get("template_id") or not st["volumes"]:
+        raise CtlError("nothing deployed yet — run `python wanctl.py deploy` first")
+    todo = [dc for dc in data_centers(cfg) if dc in st["volumes"] and (args.force or dc not in st.get("prepared", []))]
+    if args.region:
+        todo = [dc for dc in todo if dc in args.region]
+    if not todo:
+        print("every region is already prepared: " + ", ".join(st.get("prepared", [])))
+        return
+    print(f"Preparing {', '.join(todo)}: each downloads ~71 GB from Hugging Face onto its region's volume using a\n"
+          "small GPU (about 8-15 minutes and ~$0.10 per region once, plus any wait for a free GPU).", flush=True)
+    failed = []
+    with concurrent.futures.ThreadPoolExecutor(len(todo)) as pool:
+        jobs = {pool.submit(_prepare_one, rp, cfg, st, dc, token, args): dc for dc in todo}
+        for fut in concurrent.futures.as_completed(jobs):
+            dc = jobs[fut]
+            try:
+                res = fut.result()
+            except CtlError as e:
+                res = {"status": "ERROR", "error": str(e)}
+            out = res.get("output") or {}
+            ok = res.get("status") == "COMPLETED" and (out.get("job_results") or out).get("status") in ("prepared", "already_prepared")
+            print(f"[{dc}] {'prepared' if ok else 'FAILED: ' + str(out.get('error') or res.get('error') or res.get('status'))}",
+                  flush=True)
+            if ok:
+                st["prepared"] = sorted(set(st.get("prepared", [])) | {dc})
+                save_state(st)
+            else:
+                failed.append(dc)
+    _update_endpoint(rp, cfg, st)                    # start serving from the newly prepared regions
+    save_state(st)
+    if failed:
+        raise CtlError(f"prepare failed in {', '.join(failed)}; the endpoint keeps using {', '.join(st.get('prepared', []))}")
 
 
 def cmd_info(args) -> None:
@@ -302,11 +405,23 @@ def target_size(w: int, h: int, resolution: str) -> tuple[int, int]:
     return (short, long) if h >= w else (long, short)
 
 
-def encode_image(path: str, resolution: str) -> tuple[str, tuple[int, int]]:
+def parse_size(text: str, two_stage: bool) -> tuple[int, int]:
+    try:
+        w, h = (int(v) for v in text.lower().split("x"))
+    except ValueError:
+        raise CtlError(f"--size must look like 736x672, got {text!r}")
+    mult = 64 if two_stage else 32
+    if w % mult or h % mult or not (256 <= w <= 1920 and 256 <= h <= 1920):
+        raise CtlError(f"--size sides must be 256-1920 and multiples of {mult}"
+                       + ("" if not two_stage else " (or add --single-stage for multiples of 32)"))
+    return w, h
+
+
+def encode_image(path: str, resolution: str, size: Optional[tuple[int, int]] = None) -> tuple[str, tuple[int, int]]:
     """Cover-crop to the exact generation size client-side so the request stays small (worker does the same)."""
     from PIL import Image, ImageOps
     img = ImageOps.exif_transpose(Image.open(path)).convert("RGB")
-    size = target_size(img.width, img.height, resolution)
+    size = size or target_size(img.width, img.height, resolution)
     img = ImageOps.fit(img, size, method=Image.LANCZOS, centering=(0.5, 0.5))
     buf = io.BytesIO()
     img.save(buf, "JPEG", quality=95)
@@ -332,10 +447,16 @@ def cmd_generate(args) -> None:
     if not prompt:
         raise CtlError("give --prompt or --prompt-file")
     resolution = args.resolution or d.get("resolution", "720p")
-    img_b64, (w, h) = encode_image(args.image, resolution)
-    inp = {"action": "generate", "image_base64": img_b64, "prompt": prompt, "resolution": resolution,
+    size = parse_size(args.size, not args.single_stage) if args.size else None
+    img_b64, (w, h) = encode_image(args.image, resolution, size)
+    inp = {"action": "generate", "image_base64": img_b64, "prompt": prompt,
+           **({"width": w, "height": h, "two_stage": not args.single_stage} if size else {"resolution": resolution}),
            "num_frames": args.num_frames or d.get("num_frames", 121), "fps": args.fps or d.get("fps", 24),
            "crf": args.crf or d.get("crf", 19), "audio": not args.no_audio}
+    if args.loop:
+        inp["loop"] = True
+    elif args.end_image:
+        inp["end_image_base64"] = encode_image(args.end_image, resolution, (w, h))[0]
     if args.seed is not None:
         inp["seed"] = args.seed
     timeout_ms = int(args.timeout_s or d.get("timeout_s", 900)) * 1000
@@ -385,10 +506,10 @@ def cmd_costs(args) -> None:
 
 def cmd_teardown(args) -> None:
     cfg = load_config(args.config)
-    rp, st = RunPod(api_key(cfg)), load_state()
+    rp, st = RunPod(api_key(cfg)), _volumes_state(load_state())
     what = [f"endpoint {st.get('endpoint_id')}", f"template {st.get('template_id')}"]
     if args.volume:
-        what.append(f"network volume {st.get('volume_id')} (deletes the prepared ~72 GB model; re-prepare costs GPU time)")
+        what.append(f"network volumes {st.get('volumes')} (deletes the prepared ~71 GB model in each region)")
     if not args.yes:
         print("will delete:\n  " + "\n  ".join(what))
         if input("type 'delete' to confirm: ").strip() != "delete":
@@ -403,10 +524,12 @@ def cmd_teardown(args) -> None:
         rp.rest("DELETE", f"/templates/{st['template_id']}", ok404=True)
         print("template deleted")
         st.pop("template_id")
-    if args.volume and st.get("volume_id"):
-        rp.rest("DELETE", f"/networkvolumes/{st['volume_id']}", ok404=True)
-        print("network volume deleted")
-        st.pop("volume_id")
+    if args.volume:
+        for dc, vol in list(st.get("volumes", {}).items()):
+            rp.rest("DELETE", f"/networkvolumes/{vol}", ok404=True)
+            print(f"network volume {dc} deleted")
+            st["volumes"].pop(dc)
+        st["prepared"] = []
     save_state(st)
 
 
@@ -422,6 +545,7 @@ def main(argv=None) -> int:
     p = sub.add_parser("prepare")
     p.add_argument("--force", action="store_true", help="rebuild even if already prepared")
     p.add_argument("--timeout-min", type=int, default=120)
+    p.add_argument("--region", action="append", help="only prepare this data center (repeatable)")
     p.set_defaults(fn=cmd_prepare)
     sub.add_parser("info").set_defaults(fn=cmd_info)
     sub.add_parser("health").set_defaults(fn=cmd_health)
@@ -431,9 +555,13 @@ def main(argv=None) -> int:
     p.add_argument("--prompt-file")
     p.add_argument("--seed", type=int)
     p.add_argument("--resolution", choices=sorted(RESOLUTIONS), help="540p = single-stage draft; 720p/1080p two-stage")
+    p.add_argument("--size", help="exact WxH instead of --resolution, e.g. 1280x1152 for a near-square photo")
+    p.add_argument("--single-stage", action="store_true", help="with --size: one pass at full size (cheaper draft)")
     p.add_argument("--num-frames", type=int, help="8k+1, e.g. 121 = 5 s at 24 fps; up to 20 s")
     p.add_argument("--fps", type=int)
     p.add_argument("--no-audio", action="store_true", help="return a silent mp4")
+    p.add_argument("--loop", action="store_true", help="pin the input image as the LAST frame too (returns to it)")
+    p.add_argument("--end-image", help="pin this image as the last frame (cover-cropped to the same size)")
     p.add_argument("--crf", type=int)
     p.add_argument("--timeout-s", type=int)
     p.add_argument("--out")

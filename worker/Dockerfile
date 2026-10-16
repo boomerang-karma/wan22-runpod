@@ -30,6 +30,6 @@ RUN pip install -r requirements.txt
 COPY handler.py ltx_engine.py mock_engine.py ./
 
 # Fail the build early if the pinned stack cannot import the pieces the engine needs.
-RUN python -c "from diffusers import LTX2ImageToVideoPipeline, LTX2LatentUpsamplePipeline; from diffusers.pipelines.ltx2.utils import DISTILLED_SIGMA_VALUES, STAGE_2_DISTILLED_SIGMA_VALUES; from transformers import Gemma4UnifiedForConditionalGeneration; import av, runpod; print('imports ok')"
+RUN python -c "from diffusers import LTX2ImageToVideoPipeline, LTX2ConditionPipeline, LTX2LatentUpsamplePipeline; from diffusers.pipelines.ltx2.utils import DISTILLED_SIGMA_VALUES, STAGE_2_DISTILLED_SIGMA_VALUES; from transformers import Gemma4UnifiedForConditionalGeneration; import av, runpod; print('imports ok')"
 
 CMD ["python", "-u", "handler.py"]

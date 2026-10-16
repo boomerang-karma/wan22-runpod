@@ -30,7 +30,8 @@ class MockEngine:
         self.meta, self.gpu, self.load_seconds = {"mock": True}, "cpu (mock)", 0.0
 
     def generate(self, image: Image.Image, prompt: str, width: int, height: int, num_frames: int = 121,
-                 frame_rate: float = 24.0, seed: int = 0, two_stage: bool = True, progress=lambda m: None):
+                 frame_rate: float = 24.0, seed: int = 0, two_stage: bool = True, end_image=None,
+                 progress=lambda m: None):
         t = time.time()
         base = image.convert("RGB").resize((width, height), Image.BICUBIC)
         frames = []
@@ -46,5 +47,7 @@ class MockEngine:
         n = int(round(num_frames / frame_rate * self.sample_rate))
         tt = np.arange(n) / self.sample_rate
         audio = 0.1 * np.stack([np.sin(2 * np.pi * 440 * tt), np.sin(2 * np.pi * 660 * tt)]).astype(np.float32)
+        if end_image is not None:                                    # land exactly on the end frame
+            frames[-1] = np.asarray(end_image.convert("RGB").resize((width, height)))
         return (np.stack(frames).astype(np.uint8), audio, self.sample_rate,
                 {"denoise_and_decode_s": round(time.time() - t, 2)})

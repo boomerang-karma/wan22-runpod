@@ -3,10 +3,11 @@
 
 runpod:
   api_key: ""                       # RunPod console -> Settings -> API Keys. Never commit this file.
-  # The network volume (and therefore the endpoint) lives in ONE data center. Pick one where your GPU types show
-  # availability (console -> Storage -> New Network Volume shows availability per DC). Examples:
-  # EU-RO-1, EU-FR-1, US-TX-3, US-IL-1, US-NC-2, CA-MTL-1, AP-JP-1 (deploy errors list the current valid set)
-  data_center: ""
+  # Data centers the endpoint may start workers in; the first is the primary. Each one gets its own network volume
+  # (a volume only serves its own data center) and its own one-time `prepare` (~$0.10) plus $7/month storage.
+  # More regions = less waiting for a free 80 GB GPU. Valid IDs: EU-RO-1, EU-FR-1, EUR-IS-3, EUR-NO-2, US-MD-1,
+  # US-MO-1, US-NE-1, US-CO-1, US-NC-2, CA-MTL-1, AP-JP-1, ... (deploy errors list the current valid set)
+  data_centers: []
 
 huggingface:
   token: ""                         # read token for the gated LTX-2.5 weights (huggingface.co/settings/tokens).
@@ -30,6 +31,7 @@ endpoint:
     - "NVIDIA H100 80GB HBM3"
     - "NVIDIA H100 PCIe"
     - "NVIDIA H200"
+    - "NVIDIA B200"
   workers_min: 0                    # 0 = scale to zero (no idle cost). >0 keeps warm workers billed 24/7.
   workers_max: 1
   idle_timeout_s: 5                 # seconds a worker stays alive (billed) after a job, waiting for the next one

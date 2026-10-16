@@ -71,5 +71,36 @@ def test_prompt_is_pre_encoded_so_text_encoder_can_stay_off_gpu(engine, monkeypa
     calls = []
     orig = engine.pipe.text_encoder.forward
     monkeypatch.setattr(engine.pipe.text_encoder, "forward", lambda *a, **k: (calls.append(1), orig(*a, **k))[1])
-    engine.generate(_img(), "photo comes to life", width=64, height=64, num_frames=5, seed=1)
+    engine.generate(_img(), "a prompt seen for the first time", width=64, height=64, num_frames=5, seed=1)
     assert len(calls) == 1
+
+
+def test_repeated_prompt_reuses_cached_embeddings(engine, monkeypatch):
+    calls = []
+    orig = engine.pipe.text_encoder.forward
+    monkeypatch.setattr(engine.pipe.text_encoder, "forward", lambda *a, **k: (calls.append(1), orig(*a, **k))[1])
+    args = dict(width=64, height=64, num_frames=5, two_stage=False)
+    a, _, _, _ = engine.generate(_img(), "cache me", seed=5, **args)
+    b, _, _, t = engine.generate(_img(), "cache me", seed=5, **args)
+    assert len(calls) == 1 and np.array_equal(a, b)                 # second run: no encoder pass, same result
+
+
+def test_text_encoder_swaps_by_pointer_and_returns_to_host(engine):
+    te = engine.pipe.text_encoder
+    p = next(te.parameters())
+    host = p.data
+    engine._parked.up()
+    engine._parked.down()
+    assert p.data.data_ptr() == host.data_ptr()                      # back on the same host buffer, no re-allocation
+
+
+@pytest.mark.parametrize("two_stage", [False, True])
+def test_end_frame_conditions_the_last_frame(engine, two_stage):
+    start = Image.new("RGB", (64, 64), (230, 40, 40))
+    end = Image.new("RGB", (64, 64), (40, 40, 230))
+    frames, audio, _, _ = engine.generate(start, "statues come alive", width=64, height=64, num_frames=9, seed=2,
+                                          two_stage=two_stage, end_image=end)
+    assert frames.shape == (9, 64, 64, 3) and audio.shape[0] == 2
+    plain, _, _, _ = engine.generate(start, "statues come alive", width=64, height=64, num_frames=9, seed=2,
+                                     two_stage=two_stage)
+    assert not np.array_equal(frames, plain)                         # the end condition actually changed the video

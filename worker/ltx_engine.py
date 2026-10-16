@@ -16,12 +16,17 @@ Design notes (why it is shaped this way):
     GPU only to encode the prompt. Components then live on different devices, so the execution device is pinned.
   * Memory mode "offload": diffusers model CPU offload moves each component in and out per request. Needs ~80 GB
     of host RAM; slower, but fits 48 GB cards.
+  * Optional end frame: with `end_image`, LTX2ConditionPipeline pins the photo (or another image) as the LAST frame
+    too, so the clip has to return to it. This keeps identities and poses anchored over long clips.
+  * The parked text encoder lives in pinned host memory and its weights are swapped onto the GPU by pointer, so a
+    visit costs ~1-2 s of PCIe copy instead of tens of seconds; recent prompt embeddings are cached.
   * Only the convolutional VAE decoder is used. The optional diffusion decoder needs extra kernels and memory.
 """
 from __future__ import annotations
 
 import gc
 import importlib
+from collections import OrderedDict
 import json
 import logging
 import os
@@ -31,8 +36,10 @@ from typing import Callable, Optional
 
 import numpy as np
 import torch
-from diffusers import FlowMatchEulerDiscreteScheduler, LTX2ImageToVideoPipeline, LTX2LatentUpsamplePipeline
+from diffusers import (FlowMatchEulerDiscreteScheduler, LTX2ConditionPipeline, LTX2ImageToVideoPipeline,
+                       LTX2LatentUpsamplePipeline)
 from diffusers.pipelines.ltx2 import LTX2LatentUpsamplerModel
+from diffusers.pipelines.ltx2.pipeline_ltx2_condition import LTX2VideoCondition
 from diffusers.pipelines.ltx2.utils import DISTILLED_SIGMA_VALUES, STAGE_2_DISTILLED_SIGMA_VALUES
 
 log = logging.getLogger("ltx_engine")
@@ -47,6 +54,7 @@ REQUIRED = ("scheduler", "tokenizer", "text_encoder", "connectors", "transformer
 UNGUIDED = {"guidance_scale": 1.0, "audio_guidance_scale": 1.0, "stg_scale": 0.0, "audio_stg_scale": 0.0,
             "modality_scale": 1.0, "audio_modality_scale": 1.0}
 MAX_SEQ_LEN = 1024
+PROMPT_CACHE = 8
 
 Progress = Callable[[str], None]
 
@@ -157,7 +165,7 @@ def prepare(out_dir: str, work_dir: str, device: str = "cuda", progress: Progres
 
 
 # ----------------------------------------------------------------------------------------------- runtime engine
-class _PinnedDevicePipeline(LTX2ImageToVideoPipeline):
+class _PinnedDeviceMixin:
     """In "resident" mode the text encoder sits on the CPU while everything else is on the GPU. diffusers infers the
     execution device from the first module it finds, which could be the CPU-parked encoder, so pin it."""
 
@@ -165,6 +173,44 @@ class _PinnedDevicePipeline(LTX2ImageToVideoPipeline):
     def _execution_device(self):
         forced = self.__dict__.get("_forced_device")
         return torch.device(forced) if forced is not None else super()._execution_device
+
+
+class _PinnedDevicePipeline(_PinnedDeviceMixin, LTX2ImageToVideoPipeline):
+    pass
+
+
+class _PinnedDeviceConditionPipeline(_PinnedDeviceMixin, LTX2ConditionPipeline):
+    pass
+
+
+class _HostParked:
+    """Keeps a module's weights in pinned (page-locked) host memory and points them at a GPU copy only while needed.
+    `module.to("cpu")` would re-allocate ~24 GB of pageable memory on every visit; swapping `.data` pointers does not,
+    and pinned memory copies to the GPU at full PCIe speed."""
+
+    def __init__(self, module: torch.nn.Module, device: str):
+        self.module, self.device = module, device
+        pin = device.startswith("cuda") and torch.cuda.is_available()
+        self.host = {}
+        for key, t in self._tensors():
+            t.data = t.data.pin_memory() if pin else t.data
+            self.host[key] = t.data
+
+    def _tensors(self):
+        for name, p in self.module.named_parameters():
+            yield "p:" + name, p
+        for name, b in self.module.named_buffers():
+            yield "b:" + name, b
+
+    def up(self) -> None:
+        for key, t in self._tensors():
+            t.data = self.host[key].to(self.device, non_blocking=True)
+        if self.device.startswith("cuda") and torch.cuda.is_available():
+            torch.cuda.synchronize()
+
+    def down(self) -> None:
+        for key, t in self._tensors():
+            t.data = self.host[key]
 
 
 class LTXEngine:
@@ -185,12 +231,16 @@ class LTXEngine:
         parts["tokenizer"] = _load(index, model_dir, "tokenizer", dtype)
         if "duration_head" in index and os.path.isdir(os.path.join(model_dir, "duration_head")):
             parts["duration_head"] = _load(index, model_dir, "duration_head", dtype, on)
-        self.pipe = _PinnedDevicePipeline(
-            scheduler=FlowMatchEulerDiscreteScheduler.from_pretrained(model_dir, subfolder="scheduler"), **parts)
+        scheduler = FlowMatchEulerDiscreteScheduler.from_pretrained(model_dir, subfolder="scheduler")
+        self.pipe = _PinnedDevicePipeline(scheduler=scheduler, **parts)
+        self.cond_pipe = _PinnedDeviceConditionPipeline(scheduler=scheduler, **parts)    # same modules, end frames
         upsampler = LTX2LatentUpsamplerModel.from_pretrained(model_dir, subfolder="latent_upsampler", torch_dtype=dtype)
         self.upsample = LTX2LatentUpsamplePipeline(vae=parts["vae"], latent_upsampler=upsampler.to(device))
+        self._prompts: OrderedDict = OrderedDict()
         if memory_mode == "resident":
             self.pipe.__dict__["_forced_device"] = device
+            self.cond_pipe.__dict__["_forced_device"] = device
+            self._parked = _HostParked(parts["text_encoder"], device)
         else:
             self.pipe.enable_model_cpu_offload(device=device)
         if vae_tiling:
@@ -206,13 +256,18 @@ class LTXEngine:
         pipe = self.pipe
         if self.memory_mode != "resident":
             return {"prompt": prompt}
+        if prompt in self._prompts:                                  # re-rolls of the same shot skip the encoder
+            self._prompts.move_to_end(prompt)
+            embeds, mask = self._prompts[prompt]
+            return {"prompt_embeds": embeds.to(self.device), "prompt_attention_mask": mask.to(self.device)}
+
         def encode():
-            pipe.text_encoder.to(self.device)
+            self._parked.up()
             try:
                 return pipe.encode_prompt(prompt, None, do_classifier_free_guidance=False,
                                           max_sequence_length=MAX_SEQ_LEN, device=torch.device(self.device))[:2]
             finally:
-                pipe.text_encoder.to("cpu")
+                self._parked.down()
                 _free(self.device)
 
         try:
@@ -226,12 +281,16 @@ class LTXEngine:
                 embeds, mask = encode()
             finally:
                 pipe.transformer.to(self.device)
+        self._prompts[prompt] = (embeds.to("cpu"), mask.to("cpu"))
+        while len(self._prompts) > PROMPT_CACHE:
+            self._prompts.popitem(last=False)
         return {"prompt_embeds": embeds, "prompt_attention_mask": mask}
 
     @torch.inference_mode()
     def generate(self, image, prompt: str, width: int, height: int, num_frames: int = 121, frame_rate: float = 24.0,
-                 seed: int = 0, two_stage: bool = True, progress: Progress = _noop):
-        """Returns (frames uint8 [F,H,W,3], audio float32 [channels, samples], sample_rate, timings)."""
+                 seed: int = 0, two_stage: bool = True, end_image=None, progress: Progress = _noop):
+        """Returns (frames uint8 [F,H,W,3], audio float32 [channels, samples], sample_rate, timings).
+        `end_image` (same size as `image`) is pinned as the last frame; the clip must return to it."""
         timings: dict = {}
         total = len(DISTILLED_SIGMA_VALUES) + (len(STAGE_2_DISTILLED_SIGMA_VALUES) if two_stage else 0)
         done = [0]
@@ -245,26 +304,35 @@ class LTXEngine:
         text = self._encode(prompt)
         timings["encode_prompt_s"] = round(time.time() - t, 2)
         generator = torch.Generator("cpu").manual_seed(seed)
-        common = dict(image=image, num_frames=num_frames, frame_rate=frame_rate, generator=generator,
+        common = dict(num_frames=num_frames, frame_rate=frame_rate, generator=generator,
                       max_sequence_length=MAX_SEQ_LEN, callback_on_step_end=on_step, return_dict=False,
                       **UNGUIDED, **text)
+        if end_image is None:
+            pipe = self.pipe
+            common["image"] = image
+        else:
+            if self.memory_mode != "resident":
+                raise ValueError("an end frame needs memory_mode 'resident'")
+            pipe = self.cond_pipe
+            common["conditions"] = [LTX2VideoCondition(frames=image, index=0, strength=1.0),
+                                    LTX2VideoCondition(frames=end_image, index=-1, strength=1.0)]
 
         if two_stage:
             t = time.time()
-            latents, audio_latents = self.pipe(height=height // 2, width=width // 2, sigmas=DISTILLED_SIGMA_VALUES,
+            latents, audio_latents = pipe(height=height // 2, width=width // 2, sigmas=DISTILLED_SIGMA_VALUES,
                                                output_type="latent", **common)
             timings["stage1_s"] = round(time.time() - t, 2)
             t = time.time()
             latents = self.upsample(latents=latents, output_type="latent", return_dict=False)[0]
             timings["upsample_s"] = round(time.time() - t, 2)
             t = time.time()
-            video, audio = self.pipe(height=height, width=width, sigmas=STAGE_2_DISTILLED_SIGMA_VALUES,
+            video, audio = pipe(height=height, width=width, sigmas=STAGE_2_DISTILLED_SIGMA_VALUES,
                                      latents=latents, audio_latents=audio_latents,
                                      noise_scale=STAGE_2_DISTILLED_SIGMA_VALUES[0], output_type="np", **common)
             timings["stage2_and_decode_s"] = round(time.time() - t, 2)
         else:
             t = time.time()
-            video, audio = self.pipe(height=height, width=width, sigmas=DISTILLED_SIGMA_VALUES, output_type="np",
+            video, audio = pipe(height=height, width=width, sigmas=DISTILLED_SIGMA_VALUES, output_type="np",
                                      **common)
             timings["denoise_and_decode_s"] = round(time.time() - t, 2)
 

@@ -91,6 +91,19 @@ def test_bad_inputs_are_rejected_with_a_reason(tmp_path, bad, msg):
     assert "error" in out and msg in out["error"], out
 
 
+def test_loop_and_end_image_reach_the_engine(tmp_path):
+    h = _fresh_handler(tmp_path)
+    h.handler({"id": "p", "input": {"action": "prepare"}})
+    h = _fresh_handler(tmp_path)
+    base = {"prompt": "x", "image_base64": _img_b64(), "resolution": "540p", "num_frames": 9}
+    looped = h.handler({"id": "a", "input": {**base, "loop": True}})
+    other = h.handler({"id": "b", "input": {**base, "end_image_base64": _img_b64(1080, 1920)}})
+    plain = h.handler({"id": "c", "input": base})
+    assert (looped["end_frame"], other["end_frame"], plain["end_frame"]) == ("loop", "image", None)
+    bad = h.handler({"id": "d", "input": {**base, "end_image_base64": "%%%"}})
+    assert "end_image_base64" in bad["error"]
+
+
 def test_landscape_input_gets_landscape_output(tmp_path):
     h = _fresh_handler(tmp_path)
     h.handler({"id": "p", "input": {"action": "prepare"}})

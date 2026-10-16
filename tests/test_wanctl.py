@@ -24,7 +24,7 @@ def cfg(**over):
 
 def test_endpoint_payload_matches_rest_schema_fields():
     body = wanctl.endpoint_payload(cfg(), "tpl1", {"EU-RO-1": "vol1"})
-    assert body["templateId"] == "tpl1" and body["networkVolumeId"] == "vol1" and "networkVolumeIds" not in body
+    assert body["templateId"] == "tpl1" and body["networkVolumeId"] == "vol1" and body["networkVolumeIds"] == ["vol1"]
     assert body["dataCenterIds"] == ["EU-RO-1"] and body["gpuTypeIds"][0] == "NVIDIA A100 80GB PCIe"
     assert body["executionTimeoutMs"] == 900_000 and body["idleTimeout"] == 5 and body["workersMin"] == 0
     assert body["minCudaVersion"] == "13.0" and body["scalerType"] == "QUEUE_DELAY"
@@ -56,6 +56,12 @@ def test_deploy_rejects_regions_without_serverless():
         assert "US-NE-1 cannot run serverless" in str(e)
 
 
+def test_regions_with_the_full_model_take_priority():
+    st = {"volumes": {"US-MD-1": "v1", "US-MO-1": "v2", "EU-FR-1": "v3"}, "prepared": ["US-MD-1", "US-MO-1", "EU-FR-1"],
+          "prepared_full": ["EU-FR-1"]}
+    assert wanctl.serving_volumes(multi(), st) == {"EU-FR-1": "v3"}
+
+
 def test_old_single_region_state_migrates_as_prepared():
     st = wanctl._volumes_state({"volume_id": "v1", "data_center": "US-MD-1", "endpoint_id": "e"})
     assert st["volumes"] == {"US-MD-1": "v1"} and st["prepared"] == ["US-MD-1"] and "volume_id" not in st
@@ -63,7 +69,7 @@ def test_old_single_region_state_migrates_as_prepared():
 
 def test_prepare_endpoint_is_pinned_to_one_region_with_small_gpus():
     body = wanctl.prepare_endpoint_payload(multi(), "tpl", "US-MO-1", "v2")
-    assert body["dataCenterIds"] == ["US-MO-1"] and body["networkVolumeId"] == "v2" and "networkVolumeIds" not in body
+    assert body["dataCenterIds"] == ["US-MO-1"] and body["networkVolumeId"] == "v2" and body["networkVolumeIds"] == ["v2"]
     assert body["name"].endswith("-prep-US-MO-1") and "NVIDIA RTX A5000" in body["gpuTypeIds"]
     assert not any("80GB" in g for g in body["gpuTypeIds"]) and body["workersMax"] == 1
 

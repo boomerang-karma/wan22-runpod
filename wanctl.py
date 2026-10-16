@@ -161,8 +161,8 @@ def endpoint_payload(cfg: dict, template_id: str, volumes: dict[str, str]) -> di
             "idleTimeout": int(e.get("idle_timeout_s", 5)),
             "executionTimeoutMs": int(e.get("execution_timeout_s", 900)) * 1000,
             "flashboot": bool(e.get("flashboot", True)), "scalerType": "QUEUE_DELAY", "scalerValue": 4}
-    if len(dcs) > 1:
-        body["networkVolumeIds"] = [volumes[dc] for dc in dcs]          # multi-region: one volume per data center
+    # always send the list: a PATCH that only sets networkVolumeId leaves an older multi-volume list in place
+    body["networkVolumeIds"] = [volumes[dc] for dc in dcs]
     if e.get("min_cuda_version"):
         body["minCudaVersion"] = str(e["min_cuda_version"])
     return body
@@ -206,7 +206,9 @@ def serving_volumes(cfg: dict, st: dict) -> dict:
     """Data centers the main endpoint may use: only prepared ones, so no worker starts next to an empty volume.
     Before anything is prepared (first deploy), the primary data center alone."""
     vols = st.get("volumes") or {}
-    ready = {dc: vols[dc] for dc in data_centers(cfg) if dc in vols and dc in (st.get("prepared") or [])}
+    # once any region holds the full model, serve only such regions so --quality full never lands without it
+    done = st.get("prepared_full") or st.get("prepared") or []
+    ready = {dc: vols[dc] for dc in data_centers(cfg) if dc in vols and dc in done}
     if ready:
         return ready
     first = data_centers(cfg)[0]

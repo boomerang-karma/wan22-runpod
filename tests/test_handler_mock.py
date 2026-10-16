@@ -102,6 +102,26 @@ def test_loop_and_end_image_reach_the_engine(tmp_path):
     assert (looped["end_frame"], other["end_frame"], plain["end_frame"]) == ("loop", "image", None)
     bad = h.handler({"id": "d", "input": {**base, "end_image_base64": "%%%"}})
     assert "end_image_base64" in bad["error"]
+    full = h.handler({"id": "e", "input": {**base, "quality": "full", "steps": 20, "negative_prompt": "blurry",
+                                           "mid_strength": 0.5}})
+    assert (full["quality"], full["steps"], full["mid_strength"]) == ("full", 20, 0.5)
+    assert plain["quality"] == "fast" and plain["steps"] is None
+    for bad_inp, msg in (({"quality": "best"}, "quality"), ({"mid_strength": 2}, "mid_strength"),
+                         ({"quality": "full", "steps": 5}, "steps")):
+        assert msg in h.handler({"id": "f", "input": {**base, **bad_inp}})["error"]
+
+
+def test_cuda_oom_returns_error_and_restarts_the_worker(tmp_path, monkeypatch):
+    h = _fresh_handler(tmp_path)
+    h.handler({"id": "p", "input": {"action": "prepare"}})
+    h = _fresh_handler(tmp_path)
+
+    def oom(*a, **k):
+        raise RuntimeError("CUDA out of memory. Tried to allocate 2.28 GiB")
+    monkeypatch.setattr(h.ENGINE, "generate", oom)
+    out = h.handler({"id": "g", "input": {"prompt": "x", "image_base64": _img_b64(), "resolution": "540p",
+                                          "num_frames": 9}})
+    assert out["refresh_worker"] is True and "out of memory" in out["job_results"]["error"]
 
 
 def test_landscape_input_gets_landscape_output(tmp_path):

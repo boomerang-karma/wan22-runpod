@@ -20,7 +20,7 @@ image:
 network_volume:
   id: ""                            # reuse an existing volume (same data center); empty = create one on deploy
   name: wan22-weights
-  size_gb: 100                      # prepared model is ~72 GB; volumes can grow later but never shrink
+  size_gb: 120                      # ~71 GB fast model + ~38 GB full model (quality "full"); grow-only
 
 endpoint:
   name: wan22-i2v-lightning           # kept from the first deploy so the existing endpoint is updated, not duplicated

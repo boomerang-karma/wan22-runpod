@@ -104,3 +104,31 @@ def test_end_frame_conditions_the_last_frame(engine, two_stage):
     plain, _, _, _ = engine.generate(start, "statues come alive", width=64, height=64, num_frames=9, seed=2,
                                      two_stage=two_stage)
     assert not np.array_equal(frames, plain)                         # the end condition actually changed the video
+
+
+def test_full_quality_swaps_transformers_and_runs_guided_steps(engine):
+    distilled = engine.pipe.transformer
+    steps = []
+    frames, audio, _, timings = engine.generate(_img(), "statues come alive", width=64, height=64, num_frames=9,
+                                                seed=4, quality="full", steps=4, negative_prompt="blurry",
+                                                end_image=_img(), progress=steps.append)
+    assert frames.shape == (9, 64, 64, 3) and audio.shape[0] == 2
+    assert steps[-1] == "denoise step 7/7"                           # 4 guided full steps + 3 distilled refine
+    assert engine.pipe.transformer is distilled and engine.cond_pipe.transformer is distilled   # swapped back
+    assert engine._full is not None and engine._full is not distilled and "swap_s" in timings
+    fast, _, _, _ = engine.generate(_img(), "statues come alive", width=64, height=64, num_frames=9, seed=4,
+                                    end_image=_img())
+    assert not np.array_equal(frames, fast)
+
+
+def test_mid_keyframe_changes_the_clip(engine):
+    args = dict(width=64, height=64, num_frames=17, seed=6, two_stage=False)
+    plain, _, _, _ = engine.generate(_img(), "hold still", **args)
+    held, _, _, _ = engine.generate(_img(), "hold still", mid_strength=0.6, **args)
+    assert held.shape == plain.shape and not np.array_equal(held, plain)
+
+
+def test_full_quality_without_weights_is_a_clear_error(engine, monkeypatch):
+    monkeypatch.setattr(engine, "has_full", False)
+    with pytest.raises(ValueError, match="prepare --full"):
+        engine.generate(_img(), "x", width=64, height=64, num_frames=9, quality="full")

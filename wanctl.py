@@ -255,7 +255,11 @@ def cmd_deploy(args) -> None:
                 raise CtlError(f"network volume {vol_id} ({dc}) not found")
             if vol.get("dataCenterId") != dc:
                 raise CtlError(f"volume {vol_id} is in {vol.get('dataCenterId')}, expected {dc}")
-            print(f"volume {dc}: reusing {vol_id} ({vol.get('size')} GB)"
+            want = int(cfg["network_volume"]["size_gb"])
+            if int(vol.get("size") or 0) < want:                     # volumes can grow, never shrink
+                rp.rest("PATCH", f"/networkvolumes/{vol_id}", {"size": want})
+                print(f"volume {dc}: grew {vol_id} {vol.get('size')} -> {want} GB")
+            print(f"volume {dc}: reusing {vol_id} ({max(want, int(vol.get('size') or 0))} GB)"
                   + ("" if dc in st.get("prepared", []) else " — not prepared yet"))
         if not vol_id:
             vol = rp.rest("POST", "/networkvolumes", {"name": f"{cfg['network_volume']['name']}-{dc.lower()}",
@@ -340,7 +344,8 @@ def _prepare_one(rp: RunPod, cfg: dict, st: dict, dc: str, token: str, args) -> 
     ep_id = rp.rest("POST", "/endpoints", prepare_endpoint_payload(cfg, st["template_id"], dc, st["volumes"][dc]))["id"]
     print(f"{label}temporary prepare endpoint {ep_id}", flush=True)
     try:
-        return run_job(rp, ep_id, {"input": {"action": "prepare", "force": args.force, "hf_token": token},
+        return run_job(rp, ep_id, {"input": {"action": "prepare", "force": args.force, "hf_token": token,
+                                             "full": bool(args.full)},
                                    "policy": {"executionTimeout": int(args.timeout_min) * 60 * 1000}},
                        poll_s=20, label=label)
     finally:
@@ -356,7 +361,8 @@ def cmd_prepare(args) -> None:
     token = hf_token(cfg)
     if not st.get("template_id") or not st["volumes"]:
         raise CtlError("nothing deployed yet — run `python wanctl.py deploy` first")
-    todo = [dc for dc in data_centers(cfg) if dc in st["volumes"] and (args.force or dc not in st.get("prepared", []))]
+    done = st.get("prepared_full", []) if args.full else st.get("prepared", [])
+    todo = [dc for dc in data_centers(cfg) if dc in st["volumes"] and (args.force or dc not in done)]
     if args.region:
         todo = [dc for dc in todo if dc in args.region]
     if not todo:
@@ -379,6 +385,8 @@ def cmd_prepare(args) -> None:
                   flush=True)
             if ok:
                 st["prepared"] = sorted(set(st.get("prepared", [])) | {dc})
+                if args.full:
+                    st["prepared_full"] = sorted(set(st.get("prepared_full", [])) | {dc})
                 save_state(st)
             else:
                 failed.append(dc)
@@ -453,6 +461,13 @@ def cmd_generate(args) -> None:
            **({"width": w, "height": h, "two_stage": not args.single_stage} if size else {"resolution": resolution}),
            "num_frames": args.num_frames or d.get("num_frames", 121), "fps": args.fps or d.get("fps", 24),
            "crf": args.crf or d.get("crf", 19), "audio": not args.no_audio}
+    if args.quality == "full":
+        inp.update({"quality": "full", "steps": args.steps or d.get("full_steps", 30)})
+        neg = args.negative or (open(args.negative_file).read().strip() if args.negative_file else "")
+        if neg:
+            inp["negative_prompt"] = neg
+    if args.mid_strength:
+        inp["mid_strength"] = args.mid_strength
     if args.loop:
         inp["loop"] = True
     elif args.end_image:
@@ -464,6 +479,7 @@ def cmd_generate(args) -> None:
           f"({inp['num_frames'] / inp['fps']:.1f} s{', with audio' if inp['audio'] else ''}) from {os.path.basename(args.image)}")
     st = run_job(rp, ep, {"input": inp, "policy": {"executionTimeout": timeout_ms}}, poll_s=4)
     out = st.get("output") or {}
+    out = out.get("job_results", out) if isinstance(out, dict) else out     # worker asked RunPod to restart it
     if st.get("status") != "COMPLETED" or "error" in out:
         raise CtlError(f"job {st.get('id')} {st.get('status')}: {out.get('error') or st.get('error')}")
 
@@ -546,6 +562,7 @@ def main(argv=None) -> int:
     p.add_argument("--force", action="store_true", help="rebuild even if already prepared")
     p.add_argument("--timeout-min", type=int, default=120)
     p.add_argument("--region", action="append", help="only prepare this data center (repeatable)")
+    p.add_argument("--full", action="store_true", help="also download the full model (~38 GB) for --quality full")
     p.set_defaults(fn=cmd_prepare)
     sub.add_parser("info").set_defaults(fn=cmd_info)
     sub.add_parser("health").set_defaults(fn=cmd_health)
@@ -561,6 +578,12 @@ def main(argv=None) -> int:
     p.add_argument("--fps", type=int)
     p.add_argument("--no-audio", action="store_true", help="return a silent mp4")
     p.add_argument("--loop", action="store_true", help="pin the input image as the LAST frame too (returns to it)")
+    p.add_argument("--quality", choices=("fast", "full"), default="fast",
+                   help="full = full LTX-2.5 model for the motion pass (guided, ~30 steps; ~5x the GPU time)")
+    p.add_argument("--steps", type=int, help="steps for --quality full (10-60, default 30)")
+    p.add_argument("--negative", help="negative prompt for --quality full")
+    p.add_argument("--negative-file")
+    p.add_argument("--mid-strength", type=float, help="also pin the input image at the middle frame (0-1)")
     p.add_argument("--end-image", help="pin this image as the last frame (cover-cropped to the same size)")
     p.add_argument("--crf", type=int)
     p.add_argument("--timeout-s", type=int)

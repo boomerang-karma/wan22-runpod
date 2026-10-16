@@ -93,3 +93,20 @@ def test_prepare_without_access_explains_how_to_fix_it(fake_hub, tmp_path):
     with pytest.raises(RuntimeError, match="Accept the license"):
         ltx_engine.prepare(str(tmp_path / "m"), str(tmp_path / "w"), device="cpu", token=None)
     assert not os.path.exists(str(tmp_path / "m"))
+
+
+def test_prepare_full_adds_the_full_transformer_to_a_prepared_model(fake_hub, tmp_path):
+    out, work = str(tmp_path / "vol" / "m"), str(tmp_path / "w")
+    ltx_engine.prepare(out, work, device="cpu", token="hf_test")
+    assert not os.path.exists(os.path.join(out, "transformer_full"))         # not part of the default download
+    repo, calls = fake_hub
+    n = len(calls)
+    res = ltx_engine.prepare(out, work, device="cpu", token="hf_test", full=True)
+    assert res["status"] == "prepared" and res["transformer_full"]
+    assert all(p[0].startswith("transformer_full/") for p, _ in calls[n:])  # only the new folder is fetched
+    assert os.listdir(os.path.join(out, "transformer_full"))
+    assert ltx_engine.prepare(out, work, device="cpu", token="hf_test", full=True)["status"] == "already_prepared"
+    eng = ltx_engine.LTXEngine(out, device="cpu", vae_tiling=False, dtype=torch.float32)
+    frames, _, _, _ = eng.generate(Image.new("RGB", (64, 64), (90, 160, 220)), "a hero", width=64, height=64,
+                                   num_frames=9, seed=1, quality="full", steps=2)
+    assert frames.shape == (9, 64, 64, 3)

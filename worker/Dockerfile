@@ -14,7 +14,8 @@ ENV PYTHONUNBUFFERED=1 \
     PIP_NO_CACHE_DIR=1 \
     HF_XET_HIGH_PERFORMANCE=1 \
     HF_HUB_DISABLE_TELEMETRY=1 \
-    TOKENIZERS_PARALLELISM=false
+    TOKENIZERS_PARALLELISM=false \
+    PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
 RUN apt-get update \
  && apt-get install -y --no-install-recommends ffmpeg ca-certificates \

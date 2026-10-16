@@ -16,6 +16,10 @@ Design notes (why it is shaped this way):
     GPU only to encode the prompt. Components then live on different devices, so the execution device is pinned.
   * Memory mode "offload": diffusers model CPU offload moves each component in and out per request. Needs ~80 GB
     of host RAM; slower, but fits 48 GB cards.
+  * Quality "full": stage 1 (motion, faces, at half size) runs the full / SFT transformer for ~30 steps with real
+    guidance (CFG + STG + modality, negative prompt); stage 2 is the distilled 3-step refine at full size. Only one
+    22B transformer fits next to everything else on an 80 GB card, so the other one waits in pinned host RAM and
+    they swap by pointer (~2 x 38 GB over PCIe, a few seconds) around stage 2.
   * Optional end frame: with `end_image`, LTX2ConditionPipeline pins the photo (or another image) as the LAST frame
     too, so the clip has to return to it. This keeps identities and poses anchored over long clips.
   * The parked text encoder lives in pinned host memory and its weights are swapped onto the GPU by pointer, so a
@@ -40,7 +44,8 @@ from diffusers import (FlowMatchEulerDiscreteScheduler, LTX2ConditionPipeline, L
                        LTX2LatentUpsamplePipeline)
 from diffusers.pipelines.ltx2 import LTX2LatentUpsamplerModel
 from diffusers.pipelines.ltx2.pipeline_ltx2_condition import LTX2VideoCondition
-from diffusers.pipelines.ltx2.utils import DISTILLED_SIGMA_VALUES, STAGE_2_DISTILLED_SIGMA_VALUES
+from diffusers.pipelines.ltx2.utils import (DEFAULT_NEGATIVE_PROMPT, DISTILLED_SIGMA_VALUES,
+                                           STAGE_2_DISTILLED_SIGMA_VALUES)
 
 log = logging.getLogger("ltx_engine")
 
@@ -55,6 +60,8 @@ UNGUIDED = {"guidance_scale": 1.0, "audio_guidance_scale": 1.0, "stg_scale": 0.0
             "modality_scale": 1.0, "audio_modality_scale": 1.0}
 MAX_SEQ_LEN = 1024
 PROMPT_CACHE = 8
+FULL = "transformer_full"
+FULL_STEPS = 30
 
 Progress = Callable[[str], None]
 
@@ -95,24 +102,9 @@ def _load(index: dict, path: str, name: str, dtype, device: Optional[str] = None
 
 
 # ----------------------------------------------------------------------------------------------- one-time prepare
-def prepare(out_dir: str, work_dir: str, device: str = "cuda", progress: Progress = _noop, force: bool = False,
-            token: Optional[str] = None) -> dict:
-    """Build the bf16 model at `out_dir` (on the network volume). Idempotent; safe to re-run."""
+def _fetch_fn(src: str, token: Optional[str], progress: Progress):
     from huggingface_hub import snapshot_download
     from huggingface_hub.errors import GatedRepoError, RepositoryNotFoundError
-
-    if os.path.exists(os.path.join(out_dir, MARKER)) and not force:
-        with open(os.path.join(out_dir, MARKER)) as f:
-            return {"status": "already_prepared", **json.load(f)}
-
-    t_start = time.time()
-    partial = out_dir.rstrip("/") + ".partial"
-    src = os.path.join(work_dir, "ltx_src")
-    for d in (partial, src):
-        shutil.rmtree(d, ignore_errors=True)
-    os.makedirs(partial, exist_ok=True)
-    os.makedirs(src, exist_ok=True)
-    stats: dict = {"source": SRC_REPO, "source_revision": SRC_REVISION}
 
     def fetch(patterns: list[str]) -> None:
         t = time.time()
@@ -124,6 +116,68 @@ def prepare(out_dir: str, work_dir: str, device: str = "cuda", progress: Progres
                 f"https://huggingface.co/{SRC_REPO} with the account that owns the token, and send the token "
                 f"(export HF_TOKEN=... before `wanctl.py prepare`).") from None
         progress(f"downloaded {patterns} in {time.time() - t:.0f}s")
+    return fetch
+
+
+def _fetch_component(fetch, src: str, sub: str) -> Optional[int]:
+    """Download one component folder; when it has a *.index.json, only the shards that index names."""
+    fetch([f"{sub}/*.json"])
+    folder = os.path.join(src, sub)
+    indexes = [f for f in os.listdir(folder) if f.endswith(".index.json")] if os.path.isdir(folder) else []
+    if not indexes:
+        fetch([f"{sub}/*"])
+        return None
+    with open(os.path.join(folder, indexes[0])) as f:
+        shards = sorted(set(json.load(f)["weight_map"].values()))
+    fetch([f"{sub}/{s}" for s in shards])
+    return len(shards)
+
+
+def prepare_full(out_dir: str, work_dir: str, progress: Progress = _noop, token: Optional[str] = None) -> dict:
+    """Add the full / SFT transformer (~38 GB) next to an already prepared model. Idempotent."""
+    with open(os.path.join(out_dir, MARKER)) as f:
+        meta = json.load(f)
+    if os.path.isdir(os.path.join(out_dir, FULL)) and meta.get(FULL):
+        return {"status": "already_prepared", **meta}
+    src = os.path.join(work_dir, "ltx_src_full")
+    shutil.rmtree(src, ignore_errors=True)
+    os.makedirs(src, exist_ok=True)
+    t = time.time()
+    shards = _fetch_component(_fetch_fn(src, token, progress), src, FULL)
+    if not os.path.isdir(os.path.join(src, FULL)):
+        raise RuntimeError(f"{SRC_REPO}@{SRC_REVISION} has no {FULL}/ folder")
+    tmp = os.path.join(out_dir, FULL + ".partial")
+    shutil.rmtree(tmp, ignore_errors=True)
+    shutil.move(os.path.join(src, FULL), tmp)
+    os.replace(tmp, os.path.join(out_dir, FULL))
+    shutil.rmtree(src, ignore_errors=True)
+    meta[FULL] = {"shards": shards, "seconds": round(time.time() - t, 1)}
+    with open(os.path.join(out_dir, MARKER + ".tmp"), "w") as f:
+        json.dump(meta, f, indent=2)
+    os.replace(os.path.join(out_dir, MARKER + ".tmp"), os.path.join(out_dir, MARKER))
+    progress(f"{FULL}: saved")
+    return {"status": "prepared", **meta}
+
+
+def prepare(out_dir: str, work_dir: str, device: str = "cuda", progress: Progress = _noop, force: bool = False,
+            token: Optional[str] = None, full: bool = False) -> dict:
+    """Build the bf16 model at `out_dir` (on the network volume). Idempotent; safe to re-run.
+    `full` also adds the full / SFT transformer used by quality "full"."""
+    if os.path.exists(os.path.join(out_dir, MARKER)) and not force:
+        if full:
+            return prepare_full(out_dir, work_dir, progress, token)
+        with open(os.path.join(out_dir, MARKER)) as f:
+            return {"status": "already_prepared", **json.load(f)}
+
+    t_start = time.time()
+    partial = out_dir.rstrip("/") + ".partial"
+    src = os.path.join(work_dir, "ltx_src")
+    for d in (partial, src):
+        shutil.rmtree(d, ignore_errors=True)
+    os.makedirs(partial, exist_ok=True)
+    os.makedirs(src, exist_ok=True)
+    stats: dict = {"source": SRC_REPO, "source_revision": SRC_REVISION}
+    fetch = _fetch_fn(src, token, progress)
 
     fetch(["model_index.json"])
     shutil.copy2(os.path.join(src, "model_index.json"), partial)
@@ -134,16 +188,9 @@ def prepare(out_dir: str, work_dir: str, device: str = "cuda", progress: Progres
     for sub in COMPONENTS:
         if sub not in index and sub != "latent_upsampler":        # the upsampler is not a pipeline component
             continue
-        fetch([f"{sub}/*.json"])
-        indexes = [f for f in os.listdir(os.path.join(src, sub)) if f.endswith(".index.json")] \
-            if os.path.isdir(os.path.join(src, sub)) else []
-        if indexes:                                                # only the shards the index points at
-            with open(os.path.join(src, sub, indexes[0])) as f:
-                shards = sorted(set(json.load(f)["weight_map"].values()))
-            fetch([f"{sub}/{s}" for s in shards])
-            stats[sub] = {"shards": len(shards)}
-        else:
-            fetch([f"{sub}/*"])
+        shards = _fetch_component(fetch, src, sub)
+        if shards:
+            stats[sub] = {"shards": shards}
         if not os.path.isdir(os.path.join(src, sub)):
             if sub in REQUIRED:
                 raise RuntimeError(f"{SRC_REPO}@{SRC_REVISION} has no {sub}/ folder; the repo layout changed")
@@ -161,6 +208,8 @@ def prepare(out_dir: str, work_dir: str, device: str = "cuda", progress: Progres
     shutil.rmtree(out_dir, ignore_errors=True)
     os.replace(partial, out_dir)                      # atomic on the same filesystem: never a half-written model dir
     shutil.rmtree(src, ignore_errors=True)
+    if full:
+        return prepare_full(out_dir, work_dir, progress, token)
     return {"status": "prepared", **stats}
 
 
@@ -189,12 +238,15 @@ class _HostParked:
     and pinned memory copies to the GPU at full PCIe speed."""
 
     def __init__(self, module: torch.nn.Module, device: str):
+        """`module` may start on the CPU or the GPU; afterwards it is parked (on the host) until `up()`."""
         self.module, self.device = module, device
         pin = device.startswith("cuda") and torch.cuda.is_available()
         self.host = {}
         for key, t in self._tensors():
-            t.data = t.data.pin_memory() if pin else t.data
+            host = t.data.to("cpu")
+            t.data = host.pin_memory() if pin else host
             self.host[key] = t.data
+        _free(device)
 
     def _tensors(self):
         for name, p in self.module.named_parameters():
@@ -237,6 +289,12 @@ class LTXEngine:
         upsampler = LTX2LatentUpsamplerModel.from_pretrained(model_dir, subfolder="latent_upsampler", torch_dtype=dtype)
         self.upsample = LTX2LatentUpsamplePipeline(vae=parts["vae"], latent_upsampler=upsampler.to(device))
         self._prompts: OrderedDict = OrderedDict()
+        self.model_dir, self._index = model_dir, index
+        self.has_full = os.path.isdir(os.path.join(model_dir, FULL))
+        self._distilled, self._full, self._full_parked, self._distilled_parked = parts["transformer"], None, None, None
+        self._distilled_scheduler = scheduler
+        self._full_scheduler = FlowMatchEulerDiscreteScheduler.from_config(
+            scheduler.config, use_dynamic_shifting=True, shift_terminal=0.1)
         if memory_mode == "resident":
             self.pipe.__dict__["_forced_device"] = device
             self.cond_pipe.__dict__["_forced_device"] = device
@@ -252,47 +310,86 @@ class LTXEngine:
         self.load_seconds = round(time.time() - t0, 1)
         self.gpu = torch.cuda.get_device_name(0) if device.startswith("cuda") and torch.cuda.is_available() else device
 
-    def _encode(self, prompt: str) -> dict:
+    def _encode(self, prompt: str, negative: Optional[str] = None) -> dict:
+        """Prompt embeddings (+ negative ones when `negative` is not None, for guided sampling)."""
         pipe = self.pipe
+        keys = ("prompt_embeds", "prompt_attention_mask", "negative_prompt_embeds", "negative_prompt_attention_mask")
         if self.memory_mode != "resident":
-            return {"prompt": prompt}
-        if prompt in self._prompts:                                  # re-rolls of the same shot skip the encoder
-            self._prompts.move_to_end(prompt)
-            embeds, mask = self._prompts[prompt]
-            return {"prompt_embeds": embeds.to(self.device), "prompt_attention_mask": mask.to(self.device)}
+            return {"prompt": prompt, **({"negative_prompt": negative} if negative is not None else {})}
+        key = (prompt, negative)
+        if key in self._prompts:                                     # re-rolls of the same shot skip the encoder
+            self._prompts.move_to_end(key)
+            return {k: v.to(self.device) for k, v in zip(keys, self._prompts[key]) if v is not None}
 
         def encode():
             self._parked.up()
             try:
-                return pipe.encode_prompt(prompt, None, do_classifier_free_guidance=False,
-                                          max_sequence_length=MAX_SEQ_LEN, device=torch.device(self.device))[:2]
+                out = pipe.encode_prompt(prompt, negative, do_classifier_free_guidance=negative is not None,
+                                         max_sequence_length=MAX_SEQ_LEN, device=torch.device(self.device))
+                return out if negative is not None else (out[0], out[1], None, None)
             finally:
                 self._parked.down()
                 _free(self.device)
 
         try:
-            embeds, mask = encode()
+            enc = encode()
         except torch.OutOfMemoryError:
             # ~48 GB resident + ~24 GB encoder is close to an 80 GB card's limit: park the transformer for a moment
             log.warning("prompt encode hit CUDA OOM; retrying with the transformer moved to host RAM")
             pipe.transformer.to("cpu")
             _free(self.device)
             try:
-                embeds, mask = encode()
+                enc = encode()
             finally:
                 pipe.transformer.to(self.device)
-        self._prompts[prompt] = (embeds.to("cpu"), mask.to("cpu"))
+        self._prompts[key] = tuple(v.to("cpu") if v is not None else None for v in enc)
         while len(self._prompts) > PROMPT_CACHE:
             self._prompts.popitem(last=False)
-        return {"prompt_embeds": embeds, "prompt_attention_mask": mask}
+        return {k: v for k, v in zip(keys, enc) if v is not None}
+
+    def _use_transformer(self, which: str) -> None:
+        """Put the distilled or the full transformer on the GPU (the other one waits in pinned host RAM)."""
+        want = self._full if which == "full" else self._distilled
+        if self.pipe.transformer is want:
+            return
+        if which == "full":
+            if self._full is None:                                   # first full request on this worker
+                index = {**self._index, FULL: self._index["transformer"]}        # same class, other folder
+                self._full = _load(index, self.model_dir, FULL, self.dtype)
+                self._full_parked = _HostParked(self._full, self.device)
+            if self._distilled_parked is None:
+                self._distilled_parked = _HostParked(self._distilled, self.device)
+            else:
+                self._distilled_parked.down()
+            _free(self.device)
+            self._full_parked.up()
+            want = self._full
+        else:
+            self._full_parked.down()
+            _free(self.device)
+            self._distilled_parked.up()
+        for p in (self.pipe, self.cond_pipe):
+            p.register_modules(transformer=want)
 
     @torch.inference_mode()
     def generate(self, image, prompt: str, width: int, height: int, num_frames: int = 121, frame_rate: float = 24.0,
-                 seed: int = 0, two_stage: bool = True, end_image=None, progress: Progress = _noop):
+                 seed: int = 0, two_stage: bool = True, end_image=None, quality: str = "fast",
+                 steps: int = FULL_STEPS, negative_prompt: str = "", mid_strength: float = 0.0,
+                 progress: Progress = _noop):
         """Returns (frames uint8 [F,H,W,3], audio float32 [channels, samples], sample_rate, timings).
-        `end_image` (same size as `image`) is pinned as the last frame; the clip must return to it."""
+        `end_image` (same size as `image`) is pinned as the last frame; the clip must return to it.
+        `quality` "full" runs stage 1 on the full transformer for `steps` guided steps (needs `prepare --full`).
+        `mid_strength` > 0 also pins `image` at the middle frame with that strength (holds people in place)."""
+        if quality not in ("fast", "full"):
+            raise ValueError("quality must be 'fast' or 'full'")
+        full = quality == "full"
+        if full and not self.has_full:
+            raise ValueError("quality 'full' needs the full transformer on the volume: run `wanctl.py prepare --full`")
+        if full and self.memory_mode != "resident":
+            raise ValueError("quality 'full' needs memory_mode 'resident'")
         timings: dict = {}
-        total = len(DISTILLED_SIGMA_VALUES) + (len(STAGE_2_DISTILLED_SIGMA_VALUES) if two_stage else 0)
+        stage1 = steps if full else len(DISTILLED_SIGMA_VALUES)
+        total = stage1 + (len(STAGE_2_DISTILLED_SIGMA_VALUES) if two_stage else 0)
         done = [0]
 
         def on_step(_pipe, i, _t, kwargs):
@@ -302,38 +399,66 @@ class LTXEngine:
 
         t = time.time()
         text = self._encode(prompt)
+        guided = self._encode(prompt, ", ".join(x for x in (negative_prompt, DEFAULT_NEGATIVE_PROMPT) if x)) \
+            if full else None
         timings["encode_prompt_s"] = round(time.time() - t, 2)
         generator = torch.Generator("cpu").manual_seed(seed)
         common = dict(num_frames=num_frames, frame_rate=frame_rate, generator=generator,
-                      max_sequence_length=MAX_SEQ_LEN, callback_on_step_end=on_step, return_dict=False,
-                      **UNGUIDED, **text)
-        if end_image is None:
+                      max_sequence_length=MAX_SEQ_LEN, callback_on_step_end=on_step, return_dict=False)
+        if end_image is None and mid_strength <= 0:
             pipe = self.pipe
             common["image"] = image
         else:
             if self.memory_mode != "resident":
-                raise ValueError("an end frame needs memory_mode 'resident'")
+                raise ValueError("keyframes need memory_mode 'resident'")
             pipe = self.cond_pipe
-            common["conditions"] = [LTX2VideoCondition(frames=image, index=0, strength=1.0),
-                                    LTX2VideoCondition(frames=end_image, index=-1, strength=1.0)]
+            conds = [LTX2VideoCondition(frames=image, index=0, strength=1.0)]
+            if mid_strength > 0:
+                mid = max(8, (num_frames - 1) // 2 // 8 * 8)            # on the VAE's 8-frame grid
+                conds.append(LTX2VideoCondition(frames=image, index=mid, strength=float(mid_strength)))
+            if end_image is not None:
+                conds.append(LTX2VideoCondition(frames=end_image, index=-1, strength=1.0))
+            common["conditions"] = conds
+        fast = {**UNGUIDED, **text}
 
-        if two_stage:
+        if full:                                                     # stage 1: full transformer, guided
             t = time.time()
-            latents, audio_latents = pipe(height=height // 2, width=width // 2, sigmas=DISTILLED_SIGMA_VALUES,
-                                               output_type="latent", **common)
-            timings["stage1_s"] = round(time.time() - t, 2)
+            self._use_transformer("full")
+            pipe.scheduler = self._full_scheduler
+            timings["swap_s"] = round(time.time() - t, 2)
+            h1, w1 = (height // 2, width // 2) if two_stage else (height, width)
+            t = time.time()
+            try:
+                out = pipe(height=h1, width=w1, num_inference_steps=steps, output_type="latent" if two_stage else "np",
+                           **common, **guided)
+            finally:
+                pipe.scheduler = self._distilled_scheduler
+                t2 = time.time()
+                self._use_transformer("distilled")
+                timings["swap_s"] += round(time.time() - t2, 2)
+            timings["stage1_s"] = round(time.time() - t - (time.time() - t2), 2)
+            if two_stage:
+                latents, audio_latents = out
+            else:
+                video, audio = out
+        if two_stage:
+            if not full:
+                t = time.time()
+                latents, audio_latents = pipe(height=height // 2, width=width // 2, sigmas=DISTILLED_SIGMA_VALUES,
+                                              output_type="latent", **common, **fast)
+                timings["stage1_s"] = round(time.time() - t, 2)
             t = time.time()
             latents = self.upsample(latents=latents, output_type="latent", return_dict=False)[0]
             timings["upsample_s"] = round(time.time() - t, 2)
             t = time.time()
             video, audio = pipe(height=height, width=width, sigmas=STAGE_2_DISTILLED_SIGMA_VALUES,
-                                     latents=latents, audio_latents=audio_latents,
-                                     noise_scale=STAGE_2_DISTILLED_SIGMA_VALUES[0], output_type="np", **common)
+                                latents=latents, audio_latents=audio_latents,
+                                noise_scale=STAGE_2_DISTILLED_SIGMA_VALUES[0], output_type="np", **common, **fast)
             timings["stage2_and_decode_s"] = round(time.time() - t, 2)
-        else:
+        elif not full:
             t = time.time()
             video, audio = pipe(height=height, width=width, sigmas=DISTILLED_SIGMA_VALUES, output_type="np",
-                                     **common)
+                                **common, **fast)
             timings["denoise_and_decode_s"] = round(time.time() - t, 2)
 
         if self.device.startswith("cuda") and torch.cuda.is_available():

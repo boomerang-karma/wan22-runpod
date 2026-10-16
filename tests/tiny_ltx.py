@@ -56,9 +56,15 @@ def tiny_pipeline() -> LTX2ImageToVideoPipeline:
                                     transformer=transformer, vocoder=vocoder)
 
 
-def build_tiny_model_dir(path: str, marker: bool = True) -> str:
-    """Lay out a checkpoint like Lightricks/LTX-2.5-Diffusers: pipeline components + latent_upsampler/."""
-    tiny_pipeline().save_pretrained(path)
+def build_tiny_model_dir(path: str, marker: bool = True, full: bool = True) -> str:
+    """Lay out a checkpoint like Lightricks/LTX-2.5-Diffusers: pipeline components + latent_upsampler/ (+ the
+    full / SFT transformer in transformer_full/, which model_index.json does not list)."""
+    pipe = tiny_pipeline()
+    pipe.save_pretrained(path)
+    if full:
+        torch.manual_seed(1)
+        LTX2VideoTransformer3DModel.from_config(pipe.transformer.config).save_pretrained(
+            os.path.join(path, "transformer_full"))
     torch.manual_seed(0)
     LTX2LatentUpsamplerModel(in_channels=4, mid_channels=32, num_blocks_per_stage=1).save_pretrained(
         os.path.join(path, "latent_upsampler"))

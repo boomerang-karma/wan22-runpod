@@ -51,6 +51,7 @@ ENGINE = None
 LOAD_ERROR: str | None = None
 COLD_START_S: float | None = None
 _FIRST_JOB = True
+MIN_FREE_GPU_FRAC = float(os.getenv("MIN_FREE_GPU_FRAC", "0.9"))   # refuse a GPU another process is already using
 
 
 def _load_engine() -> None:
@@ -63,6 +64,10 @@ def _load_engine() -> None:
         if MODE == "mock":
             ENGINE = engine_mod.MockEngine()
         else:
+            free, total = engine_mod.torch.cuda.mem_get_info()
+            if free < MIN_FREE_GPU_FRAC * total:            # e.g. a stuck process from an earlier crash on this host
+                raise RuntimeError(f"GPU already in use by another process: only {free / 2**30:.1f} of "
+                                   f"{total / 2**30:.1f} GB free")
             ENGINE = engine_mod.LTXEngine(MODEL_DIR, memory_mode=MEMORY_MODE, vae_tiling=VAE_TILING)
         COLD_START_S = round(time.time() - PROCESS_START, 1)
         log.info("engine ready on %s in %.1fs (memory_mode=%s)", ENGINE.gpu, COLD_START_S, MEMORY_MODE)
@@ -169,8 +174,18 @@ def parse(inp: dict) -> dict:
         end, end_kind = _cover(_read_image(inp, "end_image"), w, h), "image"
     else:
         end, end_kind = None, None
+    quality = inp.get("quality", "fast")
+    if quality not in ("fast", "full"):
+        raise BadInput("'quality' must be 'fast' or 'full'")
+    negative = inp.get("negative_prompt") or ""
+    if not isinstance(negative, str) or len(negative) > 2000:
+        raise BadInput("'negative_prompt' must be a string of at most 2000 characters")
+    mid = inp.get("mid_strength", 0.0)
+    if not isinstance(mid, (int, float)) or isinstance(mid, bool) or not 0.0 <= mid <= 1.0:
+        raise BadInput("'mid_strength' must be a number between 0 and 1")
     return {
-        "image": image, "end_image": end, "end_frame": end_kind, "prompt": prompt, "width": w, "height": h, "two_stage": two_stage,
+        "image": image, "end_image": end, "end_frame": end_kind, "quality": quality,
+        "steps": _int(inp, "steps", 30, 10, 60), "negative_prompt": negative, "mid_strength": float(mid), "prompt": prompt, "width": w, "height": h, "two_stage": two_stage,
         "num_frames": nf, "fps": fps, "seed": seed, "audio": _bool(inp, "audio", True),
         "crf": _int(inp, "crf", 19, 10, 35),
     }
@@ -226,22 +241,22 @@ def do_info() -> dict:
     return {"ready": ENGINE is not None, "error": LOAD_ERROR, "mode": MODE, "model": "LTX-2.5 distilled (I2V + audio)",
             "memory_mode": MEMORY_MODE,
             "model_dir": MODEL_DIR, "gpu": getattr(ENGINE, "gpu", None), "cold_start_s": COLD_START_S,
-            "prepared": meta, "inline_limit_mb": INLINE_LIMIT_MB, "bucket": _bucket_configured()}
+            "prepared": meta, "full_quality": bool(getattr(ENGINE, "has_full", False)), "inline_limit_mb": INLINE_LIMIT_MB, "bucket": _bucket_configured()}
 
 
 def do_prepare(job: dict, inp: dict) -> dict:
     device = "cpu" if MODE == "mock" else "cuda"
     token = inp.get("hf_token") or os.getenv("HF_TOKEN") or None       # gated repo; never echoed back
     res = engine_mod.prepare(MODEL_DIR, WORK_DIR, device=device, force=bool(inp.get("force")),
-                             progress=lambda m: _progress(job, m), token=token)
+                             progress=lambda m: _progress(job, m), token=token, full=bool(inp.get("full")))
     # restart this worker so the next job loads the freshly prepared model at import time
     return {"refresh_worker": True, "job_results": res}
 
 
 def do_generate(job: dict, inp: dict) -> dict:
-    global _FIRST_JOB
     if ENGINE is None:
-        return {"error": LOAD_ERROR or "engine not loaded"}
+        out = {"error": LOAD_ERROR or "engine not loaded"}
+        return {"refresh_worker": True, "job_results": out} if "GPU already in use" in out["error"] else out
     t0 = time.time()
     try:
         p = parse(inp)
@@ -249,10 +264,26 @@ def do_generate(job: dict, inp: dict) -> dict:
         return {"error": f"bad input: {e}"}
     t_parse = time.time() - t0
 
-    frames, audio, sample_rate, timings = ENGINE.generate(
-        p["image"], p["prompt"], p["width"], p["height"], num_frames=p["num_frames"], frame_rate=float(p["fps"]),
-        seed=p["seed"], two_stage=p["two_stage"], end_image=p["end_image"], progress=lambda m: _progress(job, m))
+    try:
+        frames, audio, sample_rate, timings = _run_generate(job, p)
+    except Exception as e:
+        if "out of memory" not in str(e).lower():
+            raise
+        log.error("CUDA OOM; this worker will restart for a clean GPU: %s", e)
+        return {"refresh_worker": True, "job_results": {"error": f"CUDA out of memory: {str(e)[:300]}"}}
+    return _finish(job, p, frames, audio, sample_rate, timings, t0, t_parse)
 
+
+def _run_generate(job: dict, p: dict):
+    return ENGINE.generate(
+        p["image"], p["prompt"], p["width"], p["height"], num_frames=p["num_frames"], frame_rate=float(p["fps"]),
+        seed=p["seed"], two_stage=p["two_stage"], end_image=p["end_image"], quality=p["quality"],
+        steps=p["steps"], negative_prompt=p["negative_prompt"], mid_strength=p["mid_strength"],
+        progress=lambda m: _progress(job, m))
+
+
+def _finish(job: dict, p: dict, frames, audio, sample_rate, timings: dict, t0: float, t_parse: float) -> dict:
+    global _FIRST_JOB
     t = time.time()
     video = encode_mp4(frames, p["fps"], p["crf"], audio if p["audio"] else None, sample_rate)
     timings.update({"input_s": round(t_parse, 2), "encode_mp4_s": round(time.time() - t, 2),
@@ -262,7 +293,8 @@ def do_generate(job: dict, inp: dict) -> dict:
         _FIRST_JOB = False
 
     out = {"seed": p["seed"], "width": p["width"], "height": p["height"], "num_frames": p["num_frames"],
-           "fps": p["fps"], "two_stage": p["two_stage"], "end_frame": p["end_frame"], "audio": p["audio"] and audio is not None,
+           "fps": p["fps"], "two_stage": p["two_stage"], "end_frame": p["end_frame"], "quality": p["quality"],
+           "steps": p["steps"] if p["quality"] == "full" else None, "mid_strength": p["mid_strength"], "audio": p["audio"] and audio is not None,
            "gpu": ENGINE.gpu, "memory_mode": ENGINE.memory_mode, "video_bytes": len(video), "timings": timings}
     b64_mb = len(video) * 4 / 3 / 2**20
     if b64_mb <= INLINE_LIMIT_MB:

@@ -13,7 +13,7 @@ MARKER = "prepared.json"
 
 
 def prepare(out_dir: str, work_dir: str, device: str = "cpu", progress=lambda m: None, force: bool = False,
-            token=None) -> dict:
+            token=None, full: bool = False) -> dict:
     os.makedirs(out_dir, exist_ok=True)
     meta = {"mock": True, "prepared_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
     with open(os.path.join(out_dir, MARKER), "w") as f:
@@ -31,6 +31,7 @@ class MockEngine:
 
     def generate(self, image: Image.Image, prompt: str, width: int, height: int, num_frames: int = 121,
                  frame_rate: float = 24.0, seed: int = 0, two_stage: bool = True, end_image=None,
+                 quality: str = "fast", steps: int = 30, negative_prompt: str = "", mid_strength: float = 0.0,
                  progress=lambda m: None):
         t = time.time()
         base = image.convert("RGB").resize((width, height), Image.BICUBIC)
@@ -41,9 +42,9 @@ class MockEngine:
             x0, y0 = (width - cw) / 2, (height - ch) / 2
             frames.append(np.asarray(base.transform((width, height), Image.EXTENT, (x0, y0, x0 + cw, y0 + ch),
                                                     Image.BICUBIC)))
-        steps = 11 if two_stage else 8
-        for s in range(steps):
-            progress(f"denoise step {s + 1}/{steps}")
+        n_steps = (steps if quality == "full" else 8) + (3 if two_stage else 0)
+        for s in range(n_steps):
+            progress(f"denoise step {s + 1}/{n_steps}")
         n = int(round(num_frames / frame_rate * self.sample_rate))
         tt = np.arange(n) / self.sample_rate
         audio = 0.1 * np.stack([np.sin(2 * np.pi * 440 * tt), np.sin(2 * np.pi * 660 * tt)]).astype(np.float32)

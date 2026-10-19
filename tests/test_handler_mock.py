@@ -124,6 +124,19 @@ def test_cuda_oom_returns_error_and_restarts_the_worker(tmp_path, monkeypatch):
     assert out["refresh_worker"] is True and "out of memory" in out["job_results"]["error"]
 
 
+def test_worker_with_a_broken_gpu_asks_to_be_replaced(tmp_path, monkeypatch):
+    h = _fresh_handler(tmp_path)
+    monkeypatch.setattr(h, "MODE", "real")
+    monkeypatch.setattr(h, "ENGINE", None)
+    monkeypatch.setattr(h, "LOAD_ERROR", "engine load failed: RuntimeError('... Error 802: system not yet initialized')")
+    gen = h.handler({"id": "g", "input": {"prompt": "x", "image_base64": _img_b64()}})
+    info = h.handler({"id": "i", "input": {"action": "info"}})
+    assert gen["refresh_worker"] is True and "802" in gen["job_results"]["error"]
+    assert info["refresh_worker"] is True and info["job_results"]["ready"] is False
+    monkeypatch.setattr(h, "LOAD_ERROR", "model not prepared at /x; run the 'prepare' action once")
+    assert "refresh_worker" not in h.handler({"id": "u", "input": {"action": "info"}})   # not a host problem
+
+
 def test_landscape_input_gets_landscape_output(tmp_path):
     h = _fresh_handler(tmp_path)
     h.handler({"id": "p", "input": {"action": "prepare"}})

@@ -236,6 +236,15 @@ def _progress(job: dict, msg: str) -> None:
         runpod.serverless.progress_update(job, msg)
 
 
+def _broken(out: dict) -> dict:
+    """A worker whose GPU or model failed to load (bad host, CUDA error 802, busy GPU, ...) asks RunPod to replace
+    it; otherwise it stays "ready" and fails every job routed to it. An unprepared volume is not a host problem."""
+    if MODE == "mock" or ENGINE is not None or (LOAD_ERROR or "").startswith("model not prepared"):
+        return out
+    log.error("worker cannot serve (%s); asking RunPod to replace it", LOAD_ERROR)
+    return {"refresh_worker": True, "job_results": out}
+
+
 def do_info() -> dict:
     meta = getattr(ENGINE, "meta", None)
     return {"ready": ENGINE is not None, "error": LOAD_ERROR, "mode": MODE, "model": "LTX-2.5 distilled (I2V + audio)",
@@ -255,8 +264,7 @@ def do_prepare(job: dict, inp: dict) -> dict:
 
 def do_generate(job: dict, inp: dict) -> dict:
     if ENGINE is None:
-        out = {"error": LOAD_ERROR or "engine not loaded"}
-        return {"refresh_worker": True, "job_results": out} if "GPU already in use" in out["error"] else out
+        return _broken({"error": LOAD_ERROR or "engine not loaded"})
     t0 = time.time()
     try:
         p = parse(inp)
@@ -312,7 +320,7 @@ def handler(job: dict) -> dict:
     action = inp.get("action", "generate")
     try:
         if action == "info":
-            return do_info()
+            return _broken(do_info())
         if action == "prepare":
             return do_prepare(job, inp)
         if action == "generate":

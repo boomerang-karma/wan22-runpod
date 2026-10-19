@@ -154,6 +154,7 @@ def test_budget_and_capacity_guards(monkeypatch):
 
 def test_password_gate(monkeypatch):
     monkeypatch.setattr(server, "PASSWORD", "hunter2")
+    monkeypatch.setattr(server, "AUTH_MODE", "password")
     c = TestClient(server.app)
     assert c.get("/api/status").json()["authed"] is False
     assert c.get("/api/jobs").status_code == 401
@@ -169,3 +170,152 @@ def test_describe_health_states():
     assert d({"workers": {"throttled": 1}, "jobs": {"inQueue": 1}}, "US-MD-1")["state"] == "no_gpu"
     assert d({"workers": {"throttled": 1}, "jobs": {}}, "X")["state"] == "asleep"
     assert d({"error": "boom"}, "X")["state"] == "unknown"
+
+
+# ------------------------------------------------------------------ Auth0 login (fake tenant, real RS256 tokens)
+import json  # noqa: E402
+import urllib.parse  # noqa: E402
+
+import auth  # noqa: E402
+import jwt as pyjwt  # noqa: E402
+from cryptography.hazmat.primitives.asymmetric import rsa  # noqa: E402
+
+KEY = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+JWK = dict(json.loads(pyjwt.algorithms.RSAAlgorithm.to_jwk(KEY.public_key())), kid="k1", use="sig", alg="RS256")
+
+
+def id_token(nonce, **over):
+    now = int(time.time())
+    claims = {"iss": "https://tenant.auth0.com/", "aud": "cid", "sub": "auth0|alice", "email": "alice@example.com",
+              "email_verified": True, "name": "Alice", "iat": now, "exp": now + 600, "nonce": nonce, **over}
+    return pyjwt.encode(claims, KEY, algorithm="RS256", headers={"kid": "k1"})
+
+
+@pytest.fixture
+def tenant(monkeypatch):
+    a = auth.Auth0("tenant.auth0.com", "cid", "s3cret", "https://memes.example.com")
+    monkeypatch.setattr(server, "AUTH0", a)
+    monkeypatch.setattr(server, "AUTH_MODE", "auth0")
+    monkeypatch.setattr(auth, "_get_json", lambda url: {"keys": [JWK]})
+    issued = {}
+
+    def token_endpoint(url, data):
+        assert url == "https://tenant.auth0.com/oauth/token" and data["client_secret"] == "s3cret"
+        assert data["code"] == "good-code" and data["redirect_uri"] == "https://memes.example.com/auth/callback"
+        return {"id_token": issued["make"](issued["nonce"])}
+
+    monkeypatch.setattr(auth, "_post_form", token_endpoint)
+    return a, issued
+
+
+def sign_in(c, issued, make=id_token, code="good-code", state=None):
+    r = c.get("/login", follow_redirects=False)
+    assert r.status_code == 303 and r.headers["location"].startswith("https://tenant.auth0.com/authorize?")
+    q = urllib.parse.parse_qs(urllib.parse.urlparse(r.headers["location"]).query)
+    assert q["redirect_uri"] == ["https://memes.example.com/auth/callback"] and q["scope"] == ["openid profile email"]
+    issued.update(nonce=q["nonce"][0], make=make)
+    return c.get(f"/auth/callback?code={code}&state={state or q['state'][0]}", follow_redirects=False)
+
+
+def as_bob(nonce):
+    return id_token(nonce, sub="auth0|bob", email="bob@example.com", name="Bob")
+
+
+@needs_ffmpeg
+def test_auth0_login_and_private_galleries(tenant):
+    _, issued = tenant
+    alice, bob = TestClient(server.app), TestClient(server.app)
+    assert alice.get("/api/status").json()["authed"] is False
+    assert alice.get("/api/jobs").status_code == 401 and alice.get("/healthz").json() == {"ok": True}
+
+    r = sign_in(alice, issued)
+    assert r.status_code == 303 and r.headers["location"] == "/"
+    st = alice.get("/api/status").json()
+    assert st["authed"] and st["user"]["email"] == "alice@example.com" and st["auth_mode"] == "auth0"
+
+    j = alice.post("/api/generate", files={"image": ("p.jpg", photo(), "image/jpeg")},
+                   data={"preset": "vibing", "duration": "3"}).json()
+    t0 = time.time()
+    while alice.get(f"/api/jobs/{j['id']}").json()["status"] in ("queued", "running") and time.time() - t0 < 60:
+        time.sleep(0.2)
+    assert server.store.get(j["id"])["owner"] == "auth0|alice"
+
+    sign_in(bob, issued, make=as_bob)
+    assert bob.get("/api/status").json()["user"]["name"] == "Bob"
+    assert all(x["id"] != j["id"] for x in bob.get("/api/jobs").json())
+    assert bob.get(f"/api/jobs/{j['id']}").status_code == 404
+    assert bob.get(f"/media/{j['id']}/input.jpg").status_code == 404
+    assert bob.delete(f"/api/jobs/{j['id']}").status_code == 404
+    assert any(x["id"] == j["id"] for x in alice.get("/api/jobs").json())
+    assert alice.get(f"/media/{j['id']}/input.jpg").status_code == 200
+
+    r = alice.get("/logout", follow_redirects=False)
+    assert r.headers["location"].startswith("https://tenant.auth0.com/v2/logout?client_id=cid")
+    assert alice.get("/api/jobs").status_code == 401
+
+
+@pytest.mark.parametrize("make,state,why", [
+    (id_token, "forged", "login expired"),
+    (lambda n: id_token("other-nonce"), None, "nonce"),
+    (lambda n: id_token(n, aud="someone-else"), None, "audience"),
+    (lambda n: id_token(n, iss="https://evil.example/"), None, "issuer"),
+    (lambda n: id_token(n, exp=int(time.time()) - 3600, iat=int(time.time()) - 7200), None, "expired"),
+])
+def test_auth0_rejects_bad_callbacks(tenant, make, state, why):
+    _, issued = tenant
+    c = TestClient(server.app)
+    r = sign_in(c, issued, make=make, state=state)
+    assert r.status_code == 303 and r.headers["location"].startswith("/?login_error=")
+    assert why in urllib.parse.unquote(r.headers["location"]).lower()
+    assert c.get("/api/jobs").status_code == 401
+
+
+def test_auth0_rejects_token_from_another_key(tenant):
+    _, issued = tenant
+    other = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    forged = lambda n: pyjwt.encode({"iss": "https://tenant.auth0.com/", "aud": "cid", "sub": "auth0|mallory",
+                                     "iat": int(time.time()), "exp": int(time.time()) + 600, "nonce": n},
+                                    other, algorithm="RS256", headers={"kid": "k1"})
+    r = sign_in(TestClient(server.app), issued, make=forged)
+    assert "signature" in urllib.parse.unquote(r.headers["location"]).lower()
+
+
+def test_guest_list():
+    a = auth.Auth0("t.auth0.com", "c", "s", "https://x", allowed="boss@corp.com, @example.com")
+    assert a.is_allowed({"email": "Alice@Example.com", "email_verified": True})
+    assert a.is_allowed({"email": "boss@corp.com", "email_verified": True})
+    assert not a.is_allowed({"email": "alice@example.com", "email_verified": False})
+    assert not a.is_allowed({"email": "eve@corp.com", "email_verified": True})
+    assert not a.is_allowed({"email": "x@notexample.com", "email_verified": True})
+    assert auth.Auth0("t", "c", "s", "https://x").is_allowed({"sub": "anyone"})
+
+
+def test_guest_list_blocks_login(tenant, monkeypatch):
+    a, issued = tenant
+    monkeypatch.setattr(a, "allowed", ["@corp.com"])
+    r = sign_in(TestClient(server.app), issued)
+    assert "guest list" in urllib.parse.unquote(r.headers["location"])
+
+
+def test_per_user_limits(tenant, monkeypatch):
+    _, issued = tenant
+    c = TestClient(server.app)
+    sign_in(c, issued, make=as_bob)
+    send = lambda: c.post("/api/generate", files={"image": ("p.jpg", photo(), "image/jpeg")},
+                          data={"preset": "vibing", "duration": "3"})
+    monkeypatch.setattr(server, "USER_MAX_ACTIVE", 0)
+    r = send()
+    assert r.status_code == 429 and "you have" in r.json()["detail"]
+    monkeypatch.setattr(server, "USER_MAX_ACTIVE", 5)
+    monkeypatch.setattr(server, "USER_BUDGET_USD", 0.0)
+    r = send()
+    assert r.status_code == 402 and "allowance" in r.json()["detail"]
+
+
+def test_spend_ledger_per_user_and_old_format(tmp_path):
+    st = server.Store(str(tmp_path))
+    import datetime
+    (tmp_path / "spend.json").write_text(json.dumps({datetime.date.today().isoformat(): 0.5}))
+    assert st.spent_today() == 0.5 and st.spent_today("a") == 0.0
+    st.add_spend(0.25, "a")
+    assert st.spent_today() == 0.75 and st.spent_today("a") == 0.25 and st.spent_today("b") == 0.0

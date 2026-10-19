@@ -12,7 +12,7 @@ const ACTIVE = ["queued", "running"];
 // ------------------------------------------------------------------ helpers
 async function api(path, opts = {}) {
   const res = await fetch(path, { credentials: "same-origin", ...opts });
-  if (res.status === 401 && path !== "/api/login") { showLogin(); throw new Error("Enter the password first"); }
+  if (res.status === 401 && path !== "/api/login") { showLogin(); throw new Error("Sign in first"); }
   const body = res.headers.get("content-type")?.includes("json") ? await res.json() : null;
   if (!res.ok) throw new Error(body?.detail ? (typeof body.detail === "string" ? body.detail : JSON.stringify(body.detail)) : `HTTP ${res.status}`);
   return body;
@@ -63,7 +63,7 @@ function estimate() {
   const s = state.status;
   if (!s) return null;
   let usd = s.est_usd_per_clip_s[state.opts.quality] * Number(state.opts.duration);
-  const cold = ["asleep", "waking", "no_gpu", "unknown"].includes(s.gpu.state) && !s.mock;
+  const cold = ["asleep", "waking", "no_gpu", "unknown"].includes(s.gpu?.state) && !s.mock;
   if (cold) usd += s.cold_start_usd;
   return { usd: s.mock ? 0 : usd, cold };
 }
@@ -89,7 +89,7 @@ function syncForm() {
   else if (p.custom && $("custom").value.trim().length < 20) { ok = false; note = "Describe the motion and sound in a sentence or two."; }
   else if (state.status && state.status.active_jobs >= state.status.max_active) { ok = false; note = "A few memes are cooking already — hang on."; }
   else if (est?.cold) note = "GPU is asleep: the first meme takes 2–5 extra minutes to wake it. The next ones are fast.";
-  else if (state.status?.gpu.state === "warm") note = "GPU is warm — this one starts right away.";
+  else if (state.status?.gpu?.state === "warm") note = "GPU is warm — this one starts right away.";
   if (!state.status?.captions && ($("capTop").value || $("capBottom").value)) note = "ffmpeg isn't installed on the server, so captions won't be burned in.";
   $("goBtn").disabled = !ok;
   $("goNote").textContent = note;
@@ -268,11 +268,20 @@ async function refreshStatus() {
     const s = await api("/api/status");
     state.status = s;
     $("mockBadge").hidden = !s.mock;
-    $("gpuChip").dataset.state = s.gpu.state;
-    $("gpuLabel").textContent = s.gpu.label;
-    $("gpuChip").title = s.gpu.detail || "";
+    if (s.gpu) {
+      $("gpuChip").dataset.state = s.gpu.state;
+      $("gpuLabel").textContent = s.gpu.label;
+      $("gpuChip").title = s.gpu.detail || "";
+    }
     $("spendChip").textContent = `${money(s.spent_today_usd)} / $${s.budget_usd} today`;
     $("spendChip").classList.toggle("over", s.spent_today_usd >= s.budget_usd);
+    $("userBox").hidden = !s.user;
+    if (s.user) {
+      $("userName").textContent = s.user.name || s.user.email;
+      $("userBox").title = s.user.email;
+      $("userPic").hidden = !s.user.picture;
+      if (s.user.picture) $("userPic").src = s.user.picture;
+    }
     if (s.auth_required && !s.authed) showLogin();
     syncForm();
   } catch (e) { /* network blip; next poll retries */ }
@@ -304,7 +313,14 @@ setInterval(() => {
 }, 1000);
 
 // ------------------------------------------------------------------ login
-function showLogin() { if (!$("login").open) { $("login").showModal(); $("pw").focus(); } }
+function showLogin() {
+  if ($("login").open) return;
+  const sso = state.status?.auth_mode === "auth0";
+  $("ssoBtn").hidden = !sso;
+  $("loginForm").hidden = sso;
+  $("login").showModal();
+  (sso ? $("ssoBtn") : $("pw")).focus();
+}
 $("loginForm").onsubmit = async (e) => {
   e.preventDefault();
   try {
@@ -371,6 +387,13 @@ async function boot() {
   syncForm();
   await poll();
   schedule();
+}
+
+// an Auth0 round trip that failed comes back as /?login_error=...
+const loginError = new URLSearchParams(location.search).get("login_error");
+if (loginError) {
+  $("loginErr").textContent = loginError;
+  history.replaceState(null, "", "/");
 }
 
 loadPrefs();

@@ -1,0 +1,516 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >-
+  Meme Studio (portal/) on AWS: CloudFront (HTTPS) -> ALB -> one Fargate task (ARM64) with the gallery on EFS,
+  Auth0 login, secrets in Secrets Manager, and a CodeBuild project that builds the image into ECR.
+  Deploy with deploy/aws/deploy.sh; it fills the secrets and builds the image.
+
+Parameters:
+  AppName:
+    Type: String
+    Default: meme-studio
+    AllowedPattern: "^[a-z][a-z0-9-]{1,30}$"
+  ImageTag:
+    Type: String
+    Default: none
+    Description: Tag in this stack's ECR repository (deploy.sh builds and passes it)
+  DesiredCount:
+    Type: Number
+    Default: 1
+    AllowedValues: [0, 1]
+    Description: >-
+      0 or 1. The gallery is a set of files on EFS written by one process, so the app runs as a single task.
+  TaskCpu:
+    Type: Number
+    Default: 512
+    AllowedValues: [256, 512, 1024, 2048]
+  TaskMemory:
+    Type: Number
+    Default: 1024
+    AllowedValues: [512, 1024, 2048, 3072, 4096]
+  RunPodEndpointId:
+    Type: String
+    AllowedPattern: "^[a-z0-9]+$"
+    Description: The serverless endpoint id from .runpod_state.json
+  RunPodDataCenter:
+    Type: String
+    Default: ""
+    Description: Shown in the UI when no GPU is free (label only)
+  Auth0Domain:
+    Type: String
+    AllowedPattern: "^[A-Za-z0-9.-]+$"
+    Description: Your Auth0 tenant domain, e.g. dev-abc123.us.auth0.com (or a custom Auth0 domain)
+  Auth0ClientId:
+    Type: String
+    AllowedPattern: "^[A-Za-z0-9]+$"
+    Description: Client ID of the Auth0 "Regular Web Application" (the secret goes to Secrets Manager, not here)
+  AllowedEmails:
+    Type: String
+    Default: ""
+    Description: Optional guest list, e.g. "me@x.com,@mycompany.com". Empty = anyone who can sign in to Auth0.
+  DailyBudgetUsd:
+    Type: Number
+    Default: 5
+    Description: Estimated GPU spend per day for the whole portal; new jobs are refused beyond it
+  UserDailyBudgetUsd:
+    Type: Number
+    Default: 1
+  MaxActive:
+    Type: Number
+    Default: 3
+  UserMaxActive:
+    Type: Number
+    Default: 2
+  CloudFrontPrefixListId:
+    Type: String
+    AllowedPattern: "^pl-[a-z0-9]+$"
+    Description: com.amazonaws.global.cloudfront.origin-facing in this region (deploy.sh looks it up)
+  DomainName:
+    Type: String
+    Default: ""
+    Description: Optional custom domain (e.g. memes.example.com); point a CNAME at the CloudFront domain
+  CertificateArn:
+    Type: String
+    Default: ""
+    Description: ACM certificate for DomainName, which must be in us-east-1 (CloudFront)
+    AllowedPattern: "^(arn:aws[a-zA-Z-]*:acm:us-east-1:[0-9]{12}:certificate/.+)?$"
+    ConstraintDescription: an ACM certificate ARN in us-east-1, or empty
+
+Rules:
+  CustomDomainNeedsCertificate:
+    RuleCondition: !Not [!Equals [!Ref DomainName, ""]]
+    Assertions:
+      - Assert: !Not [!Equals [!Ref CertificateArn, ""]]
+        AssertDescription: DomainName needs a CertificateArn (ACM, us-east-1)
+
+Conditions:
+  HasDomain: !Not [!Equals [!Ref DomainName, ""]]
+
+Mappings:
+  Managed:
+    Ids:
+      CachingDisabled: 4135ea2d-6df8-44a3-9df3-4b5a84be39ad
+      AllViewerExceptHostHeader: b689b0a8-53d0-40ab-baf2-68738e2966ac
+      SecurityHeadersPolicy: 67f7725c-6f97-4210-82d7-5512b31e9d03
+
+Resources:
+  # ------------------------------------------------------------------------------------------------ network
+  # Two public subnets and no NAT gateway: the task has a public IP for outbound calls (RunPod, Auth0) and its
+  # security group only admits the load balancer, which in turn only admits CloudFront.
+  Vpc:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.42.0.0/16
+      EnableDnsHostnames: true
+      EnableDnsSupport: true
+      Tags: [{Key: Name, Value: !Ref AppName}]
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+  GatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties: {VpcId: !Ref Vpc, InternetGatewayId: !Ref InternetGateway}
+  SubnetA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: 10.42.0.0/20
+      AvailabilityZone: !Select [0, !GetAZs ""]
+      Tags: [{Key: Name, Value: !Sub "${AppName}-a"}]
+  SubnetB:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: 10.42.16.0/20
+      AvailabilityZone: !Select [1, !GetAZs ""]
+      Tags: [{Key: Name, Value: !Sub "${AppName}-b"}]
+  RouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties: {VpcId: !Ref Vpc}
+  DefaultRoute:
+    Type: AWS::EC2::Route
+    DependsOn: GatewayAttachment
+    Properties: {RouteTableId: !Ref RouteTable, DestinationCidrBlock: 0.0.0.0/0, GatewayId: !Ref InternetGateway}
+  SubnetARoutes:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties: {SubnetId: !Ref SubnetA, RouteTableId: !Ref RouteTable}
+  SubnetBRoutes:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties: {SubnetId: !Ref SubnetB, RouteTableId: !Ref RouteTable}
+
+  AlbSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Load balancer - HTTP from CloudFront only
+      VpcId: !Ref Vpc
+      SecurityGroupIngress:
+        - {IpProtocol: tcp, FromPort: 80, ToPort: 80, SourcePrefixListId: !Ref CloudFrontPrefixListId}
+  TaskSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Meme Studio task - app port from the load balancer only
+      VpcId: !Ref Vpc
+      SecurityGroupIngress:
+        - {IpProtocol: tcp, FromPort: 8000, ToPort: 8000, SourceSecurityGroupId: !Ref AlbSecurityGroup}
+  EfsSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Gallery file system - NFS from the task only
+      VpcId: !Ref Vpc
+      SecurityGroupIngress:
+        - {IpProtocol: tcp, FromPort: 2049, ToPort: 2049, SourceSecurityGroupId: !Ref TaskSecurityGroup}
+
+  # ------------------------------------------------------------------------------------------------ storage
+  # Photos, videos, job records and the spend ledger. Kept if the stack is deleted (delete it by hand).
+  FileSystem:
+    Type: AWS::EFS::FileSystem
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      Encrypted: true
+      PerformanceMode: generalPurpose
+      ThroughputMode: elastic
+      BackupPolicy: {Status: ENABLED}
+      LifecyclePolicies:
+        - TransitionToIA: AFTER_30_DAYS
+        - TransitionToPrimaryStorageClass: AFTER_1_ACCESS
+      FileSystemTags: [{Key: Name, Value: !Sub "${AppName}-gallery"}]
+  MountTargetA:
+    Type: AWS::EFS::MountTarget
+    Properties: {FileSystemId: !Ref FileSystem, SubnetId: !Ref SubnetA, SecurityGroups: [!Ref EfsSecurityGroup]}
+  MountTargetB:
+    Type: AWS::EFS::MountTarget
+    Properties: {FileSystemId: !Ref FileSystem, SubnetId: !Ref SubnetB, SecurityGroups: [!Ref EfsSecurityGroup]}
+  AccessPoint:
+    Type: AWS::EFS::AccessPoint
+    Properties:
+      FileSystemId: !Ref FileSystem
+      PosixUser: {Uid: "1000", Gid: "1000"}
+      RootDirectory:
+        Path: !Sub "/${AppName}"
+        CreationInfo: {OwnerUid: "1000", OwnerGid: "1000", Permissions: "750"}
+
+  # ------------------------------------------------------------------------------------------------ secrets
+  # deploy.sh writes RUNPOD_API_KEY and AUTH0_CLIENT_SECRET into this secret; SESSION_SECRET is generated here.
+  AppSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Description: Meme Studio runtime secrets (RunPod key, Auth0 client secret, session signing key)
+      GenerateSecretString:
+        SecretStringTemplate: '{"RUNPOD_API_KEY":"","AUTH0_CLIENT_SECRET":""}'
+        GenerateStringKey: SESSION_SECRET
+        PasswordLength: 64
+        ExcludePunctuation: true
+  # Shared between CloudFront and the load balancer so requests that skip CloudFront are refused.
+  OriginSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Description: Header value CloudFront sends and the load balancer requires
+      GenerateSecretString:
+        SecretStringTemplate: "{}"
+        GenerateStringKey: token
+        PasswordLength: 48
+        ExcludePunctuation: true
+
+  # ------------------------------------------------------------------------------------------------ image build
+  Repository:
+    Type: AWS::ECR::Repository
+    Properties:
+      RepositoryName: !Ref AppName
+      EmptyOnDelete: true
+      ImageScanningConfiguration: {ScanOnPush: true}
+      LifecyclePolicy:
+        LifecyclePolicyText: >-
+          {"rules":[{"rulePriority":1,"description":"keep the last 10 images",
+          "selection":{"tagStatus":"any","countType":"imageCountMoreThan","countNumber":10},
+          "action":{"type":"expire"}}]}
+  SourceBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketEncryption:
+        ServerSideEncryptionConfiguration: [{ServerSideEncryptionByDefault: {SSEAlgorithm: AES256}}]
+      PublicAccessBlockConfiguration:
+        {BlockPublicAcls: true, BlockPublicPolicy: true, IgnorePublicAcls: true, RestrictPublicBuckets: true}
+      OwnershipControls: {Rules: [{ObjectOwnership: BucketOwnerEnforced}]}
+      LifecycleConfiguration: {Rules: [{Id: expire-sources, Status: Enabled, ExpirationInDays: 14}]}
+  SourceBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref SourceBucket
+      PolicyDocument:
+        Statement:
+          - Sid: TlsOnly
+            Effect: Deny
+            Principal: "*"
+            Action: "s3:*"
+            Resource: [!GetAtt SourceBucket.Arn, !Sub "${SourceBucket.Arn}/*"]
+            Condition: {Bool: {"aws:SecureTransport": "false"}}
+  BuildRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement: [{Effect: Allow, Principal: {Service: codebuild.amazonaws.com}, Action: sts:AssumeRole}]
+      Policies:
+        - PolicyName: build
+          PolicyDocument:
+            Statement:
+              - {Effect: Allow, Action: ecr:GetAuthorizationToken, Resource: "*"}
+              - Effect: Allow
+                Action: [ecr:BatchCheckLayerAvailability, ecr:BatchGetImage, ecr:GetDownloadUrlForLayer,
+                         ecr:InitiateLayerUpload, ecr:UploadLayerPart, ecr:CompleteLayerUpload, ecr:PutImage]
+                Resource: !GetAtt Repository.Arn
+              - {Effect: Allow, Action: [s3:GetObject, s3:GetObjectVersion], Resource: !Sub "${SourceBucket.Arn}/*"}
+              - Effect: Allow
+                Action: [logs:CreateLogStream, logs:PutLogEvents]
+                Resource: !Sub "${BuildLogs.Arn}:*"
+  BuildLogs:
+    Type: AWS::Logs::LogGroup
+    Properties: {LogGroupName: !Sub "/codebuild/${AppName}", RetentionInDays: 14}
+  ImageBuild:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: !Sub "${AppName}-image"
+      Description: Builds portal/Dockerfile (ARM64) from the source zip deploy.sh uploads, pushes it to ECR
+      ServiceRole: !GetAtt BuildRole.Arn
+      TimeoutInMinutes: 30
+      Source:
+        Type: S3
+        Location: !Sub "${SourceBucket}/source/portal.zip"
+        BuildSpec: |
+          version: 0.2
+          env:
+            variables:
+              DOCKER_BUILDKIT: "1"
+          phases:
+            pre_build:
+              commands:
+                - aws ecr get-login-password | docker login --username AWS --password-stdin "${REPOSITORY_URI%%/*}"
+            build:
+              commands:
+                - docker build -f portal/Dockerfile -t "$REPOSITORY_URI:$IMAGE_TAG" .
+            post_build:
+              commands:
+                - test "$CODEBUILD_BUILD_SUCCEEDING" = 1
+                - docker push "$REPOSITORY_URI:$IMAGE_TAG"
+      Artifacts: {Type: NO_ARTIFACTS}
+      Environment:
+        Type: ARM_CONTAINER
+        ComputeType: BUILD_GENERAL1_SMALL
+        Image: aws/codebuild/amazonlinux-aarch64-standard:3.0
+        PrivilegedMode: true
+        EnvironmentVariables:
+          - {Name: REPOSITORY_URI, Value: !GetAtt Repository.RepositoryUri}
+          - {Name: IMAGE_TAG, Value: latest}
+      LogsConfig:
+        CloudWatchLogs: {Status: ENABLED, GroupName: !Ref BuildLogs}
+
+  # ------------------------------------------------------------------------------------------------ app
+  AppLogs:
+    Type: AWS::Logs::LogGroup
+    Properties: {LogGroupName: !Sub "/ecs/${AppName}", RetentionInDays: 30}
+  ExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement: [{Effect: Allow, Principal: {Service: ecs-tasks.amazonaws.com}, Action: sts:AssumeRole}]
+      ManagedPolicyArns: [arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy]
+      Policies:
+        - PolicyName: read-app-secret
+          PolicyDocument:
+            Statement: [{Effect: Allow, Action: secretsmanager:GetSecretValue, Resource: !Ref AppSecret}]
+  TaskRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement: [{Effect: Allow, Principal: {Service: ecs-tasks.amazonaws.com}, Action: sts:AssumeRole}]
+      Policies:
+        - PolicyName: gallery-on-efs
+          PolicyDocument:
+            Statement:
+              - Effect: Allow
+                Action: [elasticfilesystem:ClientMount, elasticfilesystem:ClientWrite]
+                Resource: !GetAtt FileSystem.Arn
+                Condition: {StringEquals: {"elasticfilesystem:AccessPointArn": !GetAtt AccessPoint.Arn}}
+  Cluster:
+    Type: AWS::ECS::Cluster
+    Properties: {ClusterName: !Ref AppName}
+  TaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Ref AppName
+      RequiresCompatibilities: [FARGATE]
+      NetworkMode: awsvpc
+      Cpu: !Ref TaskCpu
+      Memory: !Ref TaskMemory
+      RuntimePlatform: {CpuArchitecture: ARM64, OperatingSystemFamily: LINUX}
+      ExecutionRoleArn: !GetAtt ExecutionRole.Arn
+      TaskRoleArn: !GetAtt TaskRole.Arn
+      Volumes:
+        - Name: gallery
+          EFSVolumeConfiguration:
+            FilesystemId: !Ref FileSystem
+            TransitEncryption: ENABLED
+            AuthorizationConfig: {AccessPointId: !Ref AccessPoint, IAM: ENABLED}
+      ContainerDefinitions:
+        - Name: app
+          Image: !Sub "${Repository.RepositoryUri}:${ImageTag}"
+          Essential: true
+          StopTimeout: 30
+          PortMappings: [{ContainerPort: 8000, Protocol: tcp}]
+          MountPoints: [{SourceVolume: gallery, ContainerPath: /data}]
+          Environment:
+            - {Name: PORTAL_BASE_URL, Value: !If [HasDomain, !Sub "https://${DomainName}", !Sub "https://${Distribution.DomainName}"]}
+            - {Name: AUTH0_DOMAIN, Value: !Ref Auth0Domain}
+            - {Name: AUTH0_CLIENT_ID, Value: !Ref Auth0ClientId}
+            - {Name: PORTAL_ALLOWED_EMAILS, Value: !Ref AllowedEmails}
+            - {Name: RUNPOD_ENDPOINT_ID, Value: !Ref RunPodEndpointId}
+            - {Name: RUNPOD_DATA_CENTER, Value: !Ref RunPodDataCenter}
+            - {Name: PORTAL_DAILY_BUDGET_USD, Value: !Ref DailyBudgetUsd}
+            - {Name: PORTAL_USER_DAILY_BUDGET_USD, Value: !Ref UserDailyBudgetUsd}
+            - {Name: PORTAL_MAX_ACTIVE, Value: !Ref MaxActive}
+            - {Name: PORTAL_USER_MAX_ACTIVE, Value: !Ref UserMaxActive}
+            - {Name: PORTAL_DATA, Value: /data}
+            - {Name: TZ, Value: UTC}
+          Secrets:
+            - {Name: RUNPOD_API_KEY, ValueFrom: !Sub "${AppSecret}:RUNPOD_API_KEY::"}
+            - {Name: AUTH0_CLIENT_SECRET, ValueFrom: !Sub "${AppSecret}:AUTH0_CLIENT_SECRET::"}
+            - {Name: SESSION_SECRET, ValueFrom: !Sub "${AppSecret}:SESSION_SECRET::"}
+          HealthCheck:
+            Command: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/healthz', timeout=4)"]
+            Interval: 30
+            Timeout: 5
+            Retries: 3
+            StartPeriod: 30
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref AppLogs
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: app
+
+  LoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    DependsOn: GatewayAttachment
+    Properties:
+      Scheme: internet-facing
+      Subnets: [!Ref SubnetA, !Ref SubnetB]
+      SecurityGroups: [!Ref AlbSecurityGroup]
+      LoadBalancerAttributes:
+        - {Key: idle_timeout.timeout_seconds, Value: "60"}
+        - {Key: routing.http.drop_invalid_header_fields.enabled, Value: "true"}
+  TargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      VpcId: !Ref Vpc
+      TargetType: ip
+      Protocol: HTTP
+      Port: 8000
+      HealthCheckPath: /healthz
+      HealthCheckIntervalSeconds: 15
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 3
+      TargetGroupAttributes: [{Key: deregistration_delay.timeout_seconds, Value: "15"}]
+  Listener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref LoadBalancer
+      Port: 80
+      Protocol: HTTP
+      DefaultActions:
+        - Type: fixed-response
+          FixedResponseConfig: {StatusCode: "403", ContentType: text/plain, MessageBody: "Use the CloudFront URL."}
+  FromCloudFrontOnly:
+    Type: AWS::ElasticLoadBalancingV2::ListenerRule
+    Properties:
+      ListenerArn: !Ref Listener
+      Priority: 1
+      Conditions:
+        - Field: http-header
+          HttpHeaderConfig:
+            HttpHeaderName: X-Origin-Verify
+            Values: [!Sub "{{resolve:secretsmanager:${OriginSecret}:SecretString:token}}"]
+      Actions: [{Type: forward, TargetGroupArn: !Ref TargetGroup}]
+
+  Service:
+    Type: AWS::ECS::Service
+    DependsOn: [FromCloudFrontOnly, MountTargetA, MountTargetB]
+    Properties:
+      ServiceName: !Ref AppName
+      Cluster: !Ref Cluster
+      TaskDefinition: !Ref TaskDefinition
+      LaunchType: FARGATE
+      DesiredCount: !Ref DesiredCount
+      # one writer at a time: stop the old task before starting the new one (a minute of downtime per deploy;
+      # jobs in flight resume when the new task starts)
+      DeploymentConfiguration:
+        MinimumHealthyPercent: 0
+        MaximumPercent: 100
+        DeploymentCircuitBreaker: {Enable: true, Rollback: true}
+      HealthCheckGracePeriodSeconds: 60
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: ENABLED
+          Subnets: [!Ref SubnetA, !Ref SubnetB]
+          SecurityGroups: [!Ref TaskSecurityGroup]
+      LoadBalancers: [{ContainerName: app, ContainerPort: 8000, TargetGroupArn: !Ref TargetGroup}]
+
+  Distribution:
+    Type: AWS::CloudFront::Distribution
+    Metadata:
+      cfn-lint: {config: {ignore_checks: [W1030]}}            # CertificateArn is only used with a custom domain
+    Properties:
+      DistributionConfig:
+        Enabled: true
+        Comment: !Sub "${AppName} (Meme Studio)"
+        HttpVersion: http2and3
+        PriceClass: PriceClass_100
+        Aliases: !If [HasDomain, [!Ref DomainName], !Ref AWS::NoValue]
+        ViewerCertificate: !If
+          - HasDomain
+          - {AcmCertificateArn: !Ref CertificateArn, SslSupportMethod: sni-only, MinimumProtocolVersion: TLSv1.2_2021}
+          - {CloudFrontDefaultCertificate: true}
+        Origins:
+          - Id: alb
+            DomainName: !GetAtt LoadBalancer.DNSName
+            CustomOriginConfig: {OriginProtocolPolicy: http-only, HTTPPort: 80, OriginReadTimeout: 60}
+            OriginCustomHeaders:
+              - HeaderName: X-Origin-Verify
+                HeaderValue: !Sub "{{resolve:secretsmanager:${OriginSecret}:SecretString:token}}"
+        DefaultCacheBehavior:
+          TargetOriginId: alb
+          ViewerProtocolPolicy: redirect-to-https
+          AllowedMethods: [GET, HEAD, OPTIONS, PUT, POST, PATCH, DELETE]
+          CachedMethods: [GET, HEAD]
+          Compress: true
+          CachePolicyId: !FindInMap [Managed, Ids, CachingDisabled]
+          OriginRequestPolicyId: !FindInMap [Managed, Ids, AllViewerExceptHostHeader]
+          ResponseHeadersPolicyId: !FindInMap [Managed, Ids, SecurityHeadersPolicy]
+
+Outputs:
+  AppUrl:
+    Description: Open this
+    Value: !If [HasDomain, !Sub "https://${DomainName}", !Sub "https://${Distribution.DomainName}"]
+  Auth0CallbackUrl:
+    Description: Auth0 application -> Allowed Callback URLs
+    Value: !If [HasDomain, !Sub "https://${DomainName}/auth/callback", !Sub "https://${Distribution.DomainName}/auth/callback"]
+  Auth0LogoutUrl:
+    Description: Auth0 application -> Allowed Logout URLs
+    Value: !If [HasDomain, !Sub "https://${DomainName}/", !Sub "https://${Distribution.DomainName}/"]
+  CloudFrontDomain:
+    Description: Point your custom domain's CNAME here
+    Value: !GetAtt Distribution.DomainName
+  RepositoryUri:
+    Value: !GetAtt Repository.RepositoryUri
+  BuildProject:
+    Value: !Ref ImageBuild
+  SourceBucketName:
+    Value: !Ref SourceBucket
+  AppSecretArn:
+    Value: !Ref AppSecret
+  ClusterName:
+    Value: !Ref Cluster
+  ServiceName:
+    Value: !GetAtt Service.Name
+  LogGroup:
+    Value: !Ref AppLogs
+  FileSystemId:
+    Description: The gallery (kept if the stack is deleted)
+    Value: !Ref FileSystem

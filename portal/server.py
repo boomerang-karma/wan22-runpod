@@ -7,10 +7,20 @@ editing a caption later is free (no new GPU job).
   python portal/server.py                       real mode: uses config.yaml + .runpod_state.json like wanctl.py
   PORTAL_MOCK=1 python portal/server.py         no GPU: fakes the job with an ffmpeg zoom of the photo
 
+Access (first match wins):
+  AUTH0_DOMAIN, AUTH0_CLIENT_ID, AUTH0_CLIENT_SECRET, PORTAL_BASE_URL
+                            Auth0 login; every user gets their own gallery and limits (see auth.py)
+  PORTAL_ALLOWED_EMAILS     with Auth0: optional guest list, e.g. "a@x.com,@company.com"
+  PORTAL_PASSWORD           one shared password (cookie), one shared gallery
+  (neither)                 open, for local use only
+
 Environment:
-  PORTAL_PASSWORD           if set, visitors must enter it once (cookie). Set it before sharing the URL.
+  RUNPOD_API_KEY + RUNPOD_ENDPOINT_ID   use these instead of config.yaml / .runpod_state.json (containers)
+  SESSION_SECRET            signs the session cookie; set it so logins survive restarts
   PORTAL_DAILY_BUDGET_USD   stop accepting jobs once today's estimated spend reaches this (default 5)
+  PORTAL_USER_DAILY_BUDGET_USD  the same cap per signed-in user (default: the global one)
   PORTAL_MAX_ACTIVE         max queued + running jobs at once (default 3)
+  PORTAL_USER_MAX_ACTIVE    the same per user (default: the global one)
   PORTAL_DATA               where uploads, videos and the gallery live (default ./portal_data)
   PORTAL_HOST / PORTAL_PORT bind address (default 127.0.0.1:8000)
 """
@@ -32,18 +42,21 @@ import sys
 import tempfile
 import threading
 import time
+import urllib.parse
 import uuid
 from typing import Optional
 
 import requests
 from fastapi import Body, FastAPI, File, Form, HTTPException, Request, Response, UploadFile
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from PIL import Image, ImageDraw, ImageFont, ImageOps
+from starlette.middleware.sessions import SessionMiddleware
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
 sys.path[:0] = [ROOT, HERE]
+import auth  # noqa: E402
 import presets  # noqa: E402
 import wanctl  # noqa: E402
 
@@ -55,9 +68,16 @@ MOCK_DELAY = float(os.getenv("PORTAL_MOCK_DELAY", "1.5"))          # seconds per
 DATA = os.path.abspath(os.getenv("PORTAL_DATA", os.path.join(ROOT, "portal_data")))
 CONFIG = os.getenv("PORTAL_CONFIG", os.path.join(ROOT, "config.yaml"))
 PASSWORD = os.getenv("PORTAL_PASSWORD", "")
-SECRET = (os.getenv("PORTAL_SECRET") or secrets.token_hex(16)).encode()
+SECRET = (os.getenv("SESSION_SECRET") or os.getenv("PORTAL_SECRET") or secrets.token_hex(16)).encode()
+BASE_URL = os.getenv("PORTAL_BASE_URL", "").rstrip("/")
+AUTH0 = auth.Auth0(os.getenv("AUTH0_DOMAIN", ""), os.getenv("AUTH0_CLIENT_ID", ""),
+                   os.getenv("AUTH0_CLIENT_SECRET", ""), BASE_URL, os.getenv("PORTAL_ALLOWED_EMAILS", "")) \
+    if os.getenv("AUTH0_DOMAIN") else None
+AUTH_MODE = "auth0" if AUTH0 else "password" if PASSWORD else "open"
 BUDGET_USD = float(os.getenv("PORTAL_DAILY_BUDGET_USD", "5"))
+USER_BUDGET_USD = float(os.getenv("PORTAL_USER_DAILY_BUDGET_USD") or BUDGET_USD)
 MAX_ACTIVE = int(os.getenv("PORTAL_MAX_ACTIVE", "3"))
+USER_MAX_ACTIVE = int(os.getenv("PORTAL_USER_MAX_ACTIVE") or MAX_ACTIVE)
 POLL_S = 3.0
 MAX_UPLOAD_MB = 20
 
@@ -74,6 +94,7 @@ ACTIVE = ("queued", "running")
 FFMPEG = shutil.which("ffmpeg")
 FONTS = ("/System/Library/Fonts/Supplemental/Impact.ttf", "/Library/Fonts/Impact.ttf",
          "/usr/share/fonts/truetype/msttcorefonts/Impact.ttf", "C:/Windows/Fonts/impact.ttf",
+         "/usr/share/fonts/truetype/anton/Anton-Regular.ttf",              # the container's Impact stand-in
          "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", "/System/Library/Fonts/Supplemental/Arial Bold.ttf")
 
 
@@ -121,21 +142,30 @@ class Store:
             self.jobs.pop(jid, None)
             shutil.rmtree(self.dir(jid), ignore_errors=True)
 
-    def active(self) -> int:
+    def active(self, owner: Optional[str] = None) -> int:
         with self.lock:
-            return sum(j["status"] in ACTIVE for j in self.jobs.values())
+            return sum(j["status"] in ACTIVE and (owner is None or j.get("owner") == owner)
+                       for j in self.jobs.values())
 
-    # spend ledger (estimated USD per local day)
-    def spent_today(self) -> float:
-        return self._ledger().get(datetime.date.today().isoformat(), 0.0)
+    # spend ledger: estimated USD per local day, in total and per user
+    def spent_today(self, owner: Optional[str] = None) -> float:
+        day = self._day(self._ledger(), datetime.date.today().isoformat())
+        return day["total"] if owner is None else day["users"].get(owner, 0.0)
 
-    def add_spend(self, usd: float) -> None:
+    def add_spend(self, usd: float, owner: str) -> None:
         with self.lock:
             led = self._ledger()
-            day = datetime.date.today().isoformat()
-            led[day] = round(led.get(day, 0.0) + usd, 4)
+            key = datetime.date.today().isoformat()
+            day = led[key] = self._day(led, key)
+            day["total"] = round(day["total"] + usd, 4)
+            day["users"][owner] = round(day["users"].get(owner, 0.0) + usd, 4)
             with open(os.path.join(self.root, "spend.json"), "w") as f:
                 json.dump(led, f, indent=2)
+
+    @staticmethod
+    def _day(led: dict, key: str) -> dict:
+        v = led.get(key, 0.0)
+        return v if isinstance(v, dict) else {"total": float(v), "users": {}}     # old format: a plain total
 
     def _ledger(self) -> dict:
         p = os.path.join(self.root, "spend.json")
@@ -247,10 +277,18 @@ class Backend:
         self.cfg: dict = {}
         self.endpoint = ""
         self._health: tuple[float, dict] = (0.0, {})
-        if not MOCK:
+        if MOCK:
+            return
+        if os.getenv("RUNPOD_ENDPOINT_ID"):                 # container: no config.yaml, settings from env
+            import yaml
+            with open(os.path.join(ROOT, "config.example.yaml")) as f:
+                self.cfg = yaml.safe_load(f)                # pricing table + idle timeout for cost estimates
+            self.cfg["runpod"]["data_centers"] = [d for d in os.getenv("RUNPOD_DATA_CENTER", "").split(",") if d]
+            self.endpoint = os.environ["RUNPOD_ENDPOINT_ID"]
+        else:
             self.cfg = wanctl.load_config(CONFIG)
-            self.key = wanctl.api_key(self.cfg)
             self.endpoint = wanctl._endpoint_id(self.cfg)
+        self.key = wanctl.api_key(self.cfg)
 
     def rp(self) -> wanctl.RunPod:
         return wanctl.RunPod(self.key)
@@ -266,7 +304,7 @@ class Backend:
             except Exception as e:                                    # keep the page alive if RunPod blips
                 h = {"error": str(e)}
             self._health = (time.time(), h)
-        return describe_health(h, self.cfg.get("runpod", {}).get("data_center", ""))
+        return describe_health(h, ", ".join(wanctl.data_centers(self.cfg)) or "the endpoint's data centers")
 
     # one thread per job
     def start(self, jid: str) -> None:
@@ -357,7 +395,7 @@ class Backend:
             elif status in ("CANCELLED", "TIMED_OUT", "FAILED"):
                 # a cancelled job may still have started a worker; count the execution time it reports
                 cost = wanctl.estimate_cost(self.cfg, {"gpu": ""}, st.get("executionTime"))
-                self.store.add_spend(cost.get("usd_est") or 0.0)
+                self.store.add_spend(cost.get("usd_est") or 0.0, job.get("owner", "local"))
                 self.store.update(jid, status="cancelled" if status == "CANCELLED" else "failed", stage="",
                                   error=None if status == "CANCELLED" else (st.get("error") or status),
                                   finished=time.time())
@@ -368,7 +406,7 @@ class Backend:
         job = self.store.get(jid)
         self._stage(jid, "running", "adding captions")
         video = burn_captions(self.store.dir(jid), job["width"], job["height"], job["caption_top"], job["caption_bottom"])
-        self.store.add_spend(cost)
+        self.store.add_spend(cost, job.get("owner", "local"))
         self.store.update(jid, status="completed", stage="", video=video, cost_usd=cost, gpu=out.get("gpu"),
                           execution_ms=exec_ms, delay_ms=delay_ms, finished=time.time(),
                           cold_start_s=(out.get("timings") or {}).get("cold_start_s"))
@@ -404,25 +442,55 @@ def describe_health(h: dict, dc: str) -> dict:
 # ----------------------------------------------------------------------------------------------- app
 store = Store(DATA)
 backend = Backend(store)
+if AUTH0:
+    AUTH0.check_config()
+    if not (os.getenv("SESSION_SECRET") or os.getenv("PORTAL_SECRET")):
+        log.warning("SESSION_SECRET is not set: everyone is signed out whenever the portal restarts")
 app = FastAPI(title="Meme Studio", docs_url=None, redoc_url=None)
 app.mount("/static", StaticFiles(directory=os.path.join(HERE, "static")), name="static")
 TOKEN = hmac.new(SECRET, b"meme-portal", hashlib.sha256).hexdigest()
+OPEN_PATHS = ("/api/login", "/api/status")
 
 
-def authed(request: Request) -> bool:
-    return not PASSWORD or hmac.compare_digest(request.cookies.get("portal_auth", ""), TOKEN)
+def current_user(request: Request) -> Optional[dict]:
+    """Who is asking: the Auth0 user, the shared password holder, or the local user (open mode); None = nobody."""
+    if AUTH_MODE == "auth0":
+        return request.session.get("user")
+    if AUTH_MODE == "password":
+        ok = hmac.compare_digest(request.cookies.get("portal_auth", ""), TOKEN)
+        return {"sub": "shared", "name": "Guest"} if ok else None
+    return {"sub": "local", "name": "You"}
 
 
 @app.middleware("http")
 async def gate(request: Request, call_next):
     path = request.url.path
-    if (path.startswith("/api/") or path.startswith("/media/")) and path not in ("/api/login", "/api/status") \
-            and not authed(request):
-        return JSONResponse({"detail": "enter the password first"}, status_code=401)
+    if (path.startswith("/api/") or path.startswith("/media/")) and path not in OPEN_PATHS:
+        user = current_user(request)
+        if user is None:
+            return JSONResponse({"detail": "sign in first"}, status_code=401)
+        request.state.user = user
     response = await call_next(request)
     if path.startswith("/static/"):
         response.headers["Cache-Control"] = "no-cache"           # revalidate so UI updates show up on reload
     return response
+
+
+# added after the gate, so it wraps it: the gate can read request.session
+app.add_middleware(SessionMiddleware, secret_key=SECRET.decode(), session_cookie="meme_session",
+                   max_age=14 * 86400, same_site="lax", https_only=BASE_URL.startswith("https://"))
+
+
+def owner(request: Request) -> str:
+    return request.state.user["sub"]
+
+
+def my_job(request: Request, jid: str) -> dict:
+    """With Auth0 every user sees only their own memes; password and open modes share one gallery."""
+    job = store.get(jid)
+    if AUTH_MODE == "auth0" and job.get("owner") != owner(request):
+        raise HTTPException(404, "no such meme")
+    return job
 
 
 def public(job: dict) -> dict:
@@ -449,23 +517,62 @@ def index():
     return FileResponse(os.path.join(HERE, "static", "index.html"), headers={"Cache-Control": "no-cache"})
 
 
+@app.get("/healthz")
+def healthz():
+    return {"ok": True}
+
+
+@app.get("/login")
+def login_redirect(request: Request):
+    if not AUTH0:
+        return RedirectResponse("/", status_code=303)
+    return RedirectResponse(AUTH0.authorize_url(request.session), status_code=303)
+
+
+@app.get("/auth/callback")
+def auth_callback(request: Request):
+    if not AUTH0:
+        return RedirectResponse("/", status_code=303)
+    try:
+        user = AUTH0.callback(request.session, dict(request.query_params))
+    except auth.AuthError as e:
+        log.warning("login failed: %s", e)
+        return RedirectResponse("/?login_error=" + urllib.parse.quote(str(e)[:300]), status_code=303)
+    request.session["user"] = user
+    log.info("login: %s (%s)", user["email"] or user["sub"], user["sub"])
+    return RedirectResponse("/", status_code=303)
+
+
+@app.get("/logout")
+def logout(request: Request):
+    request.session.clear()
+    response = RedirectResponse(AUTH0.logout_url() if AUTH0 else "/", status_code=303)
+    response.delete_cookie("portal_auth")
+    return response
+
+
 @app.get("/api/status")
 def status(request: Request):
-    spent = store.spent_today()
-    return {"mock": MOCK, "auth_required": bool(PASSWORD), "authed": authed(request),
-            "budget_usd": BUDGET_USD, "spent_today_usd": round(spent, 3), "gpu": backend.health(),
-            "active_jobs": store.active(), "max_active": MAX_ACTIVE, "captions": bool(FFMPEG),
-            "est_usd_per_clip_s": EST_USD_PER_CLIP_S, "cold_start_usd": COLD_START_USD}
+    user = current_user(request)
+    me = user["sub"] if user and AUTH_MODE == "auth0" else None      # per-user numbers when people sign in
+    return {"mock": MOCK, "auth_mode": AUTH_MODE, "auth_required": AUTH_MODE != "open", "authed": user is not None,
+            "user": {k: user.get(k, "") for k in ("name", "email", "picture")} if user and me else None,
+            "budget_usd": USER_BUDGET_USD if me else BUDGET_USD,
+            "spent_today_usd": round(store.spent_today(me), 3),
+            "gpu": backend.health() if user else None,
+            "active_jobs": store.active(me), "max_active": USER_MAX_ACTIVE if me else MAX_ACTIVE,
+            "captions": bool(FFMPEG), "est_usd_per_clip_s": EST_USD_PER_CLIP_S, "cold_start_usd": COLD_START_USD}
 
 
 @app.post("/api/login")
 def login(response: Response, password: str = Body(..., embed=True)):
-    if not PASSWORD:
+    if AUTH_MODE != "password":
         return {"ok": True}
     if not hmac.compare_digest(password.encode(), PASSWORD.encode()):
         time.sleep(0.7)
         raise HTTPException(401, "wrong password")
-    response.set_cookie("portal_auth", TOKEN, httponly=True, samesite="lax", max_age=30 * 86400)
+    response.set_cookie("portal_auth", TOKEN, httponly=True, samesite="lax", max_age=30 * 86400,
+                        secure=BASE_URL.startswith("https://"))
     return {"ok": True}
 
 
@@ -475,27 +582,33 @@ def list_presets():
 
 
 @app.get("/api/jobs")
-def list_jobs():
+def list_jobs(request: Request):
+    me = owner(request)
     with store.lock:
-        jobs = sorted(store.jobs.values(), key=lambda j: j["created"], reverse=True)
-    return [public(j) for j in jobs]
+        jobs = [j for j in store.jobs.values() if AUTH_MODE != "auth0" or j.get("owner") == me]
+    return [public(j) for j in sorted(jobs, key=lambda j: j["created"], reverse=True)]
 
 
 @app.get("/api/jobs/{jid}")
-def get_job(jid: str):
-    return public(store.get(jid))
+def get_job(request: Request, jid: str):
+    return public(my_job(request, jid))
 
 
-def _check_capacity(quality: str, duration: int) -> None:
+def _check_capacity(me: str, quality: str, duration: int) -> None:
     if store.active() >= MAX_ACTIVE:
         raise HTTPException(429, f"{MAX_ACTIVE} memes are already cooking — wait for one to finish")
+    if store.active(me) >= USER_MAX_ACTIVE:
+        raise HTTPException(429, f"you have {USER_MAX_ACTIVE} memes cooking — wait for one to finish")
     est = estimate(quality, duration, backend.health()["state"])
     if store.spent_today() + est > BUDGET_USD:
-        raise HTTPException(402, f"today's budget (${BUDGET_USD:.2f}) is used up; "
-                                 f"spent ${store.spent_today():.2f}. Raise PORTAL_DAILY_BUDGET_USD to continue.")
+        raise HTTPException(402, f"the portal's budget for today (${BUDGET_USD:.2f}) is used up; "
+                                 f"spent ${store.spent_today():.2f}. It resets at midnight.")
+    if store.spent_today(me) + est > USER_BUDGET_USD:
+        raise HTTPException(402, f"you've used today's ${USER_BUDGET_USD:.2f} allowance "
+                                 f"(spent ${store.spent_today(me):.2f}). It resets at midnight.")
 
 
-def _new_job(src_dir: str, *, preset: str, subject: str, line: str, custom: str, caption_top: str,
+def _new_job(request: Request, src_dir: str, *, preset: str, subject: str, line: str, custom: str, caption_top: str,
              caption_bottom: str, quality: str, aspect: str, duration: int, audio: bool, seed: Optional[int]) -> dict:
     if quality not in SIZES:
         raise HTTPException(400, "quality must be draft or hd")
@@ -505,7 +618,8 @@ def _new_job(src_dir: str, *, preset: str, subject: str, line: str, custom: str,
         prompt = presets.build_prompt(preset, subject=subject, line=line, custom=custom)
     except presets.PresetError as e:
         raise HTTPException(400, str(e))
-    _check_capacity(quality, duration)
+    user = request.state.user
+    _check_capacity(user["sub"], quality, duration)
     jid = time.strftime("%Y%m%d-%H%M%S-") + uuid.uuid4().hex[:6]
     d = store.dir(jid)
     os.makedirs(d)
@@ -516,6 +630,7 @@ def _new_job(src_dir: str, *, preset: str, subject: str, line: str, custom: str,
     crop_to(os.path.join(d, "source.jpg"), os.path.join(d, "input.jpg"), (w, h))
     p = presets.BY_ID[preset]
     job = {"id": jid, "created": time.time(), "status": "queued", "stage": "Sending to the GPU",
+           "owner": user["sub"], "owner_email": user.get("email", ""),
            "preset": preset, "preset_name": p["name"], "emoji": p["emoji"], "subject": subject, "line": line,
            "custom": custom, "caption_top": caption_top[:200], "caption_bottom": caption_bottom[:200],
            "quality": quality, "aspect": aspect, "duration": duration, "num_frames": FRAMES[duration],
@@ -527,10 +642,11 @@ def _new_job(src_dir: str, *, preset: str, subject: str, line: str, custom: str,
 
 
 @app.post("/api/generate")
-async def generate(image: UploadFile = File(...), preset: str = Form(...), subject: str = Form(""),
-                   line: str = Form(""), custom: str = Form(""), caption_top: str = Form(""),
-                   caption_bottom: str = Form(""), quality: str = Form("draft"), aspect: str = Form("auto"),
-                   duration: int = Form(5), audio: bool = Form(True), seed: Optional[int] = Form(None)):
+async def generate(request: Request, image: UploadFile = File(...), preset: str = Form(...),
+                   subject: str = Form(""), line: str = Form(""), custom: str = Form(""),
+                   caption_top: str = Form(""), caption_bottom: str = Form(""), quality: str = Form("draft"),
+                   aspect: str = Form("auto"), duration: int = Form(5), audio: bool = Form(True),
+                   seed: Optional[int] = Form(None)):
     raw = await image.read(MAX_UPLOAD_MB * 2**20 + 1)
     if len(raw) > MAX_UPLOAD_MB * 2**20:
         raise HTTPException(413, f"image is larger than {MAX_UPLOAD_MB} MB")
@@ -543,26 +659,26 @@ async def generate(image: UploadFile = File(...), preset: str = Form(...), subje
     img.thumbnail((2048, 2048), Image.LANCZOS)
     with tempfile.TemporaryDirectory(dir=DATA) as t:
         img.save(os.path.join(t, "source.jpg"), "JPEG", quality=95)
-        return _new_job(t, preset=preset, subject=subject, line=line, custom=custom, caption_top=caption_top,
-                        caption_bottom=caption_bottom, quality=quality, aspect=aspect, duration=duration,
-                        audio=audio, seed=seed)
+        return _new_job(request, t, preset=preset, subject=subject, line=line, custom=custom,
+                        caption_top=caption_top, caption_bottom=caption_bottom, quality=quality, aspect=aspect,
+                        duration=duration, audio=audio, seed=seed)
 
 
 @app.post("/api/jobs/{jid}/remix")
-def remix(jid: str, body: dict = Body(default={})):
+def remix(request: Request, jid: str, body: dict = Body(default={})):
     """Same photo and settings; new seed unless keep_seed; optional overrides (e.g. quality=hd for the final)."""
-    old = store.get(jid)
+    old = my_job(request, jid)
     fields = {k: old.get(k) for k in ("preset", "subject", "line", "custom", "caption_top", "caption_bottom",
                                        "quality", "aspect", "duration", "audio")}
     fields.update({k: v for k, v in body.items() if k in fields})
     seed = old["seed"] if body.get("keep_seed") else None
-    return _new_job(store.dir(jid), seed=seed, **fields)
+    return _new_job(request, store.dir(jid), seed=seed, **fields)
 
 
 @app.post("/api/jobs/{jid}/captions")
-def recaption(jid: str, caption_top: str = Body(""), caption_bottom: str = Body("")):
+def recaption(request: Request, jid: str, caption_top: str = Body(""), caption_bottom: str = Body("")):
     """Re-burn captions on the finished video: no GPU, no cost."""
-    job = store.get(jid)
+    job = my_job(request, jid)
     if job["status"] != "completed":
         raise HTTPException(409, "the meme isn't finished yet")
     video = burn_captions(store.dir(jid), job["width"], job["height"], caption_top[:200], caption_bottom[:200])
@@ -570,26 +686,26 @@ def recaption(jid: str, caption_top: str = Body(""), caption_bottom: str = Body(
 
 
 @app.post("/api/jobs/{jid}/cancel")
-def cancel(jid: str):
-    job = store.get(jid)
+def cancel(request: Request, jid: str):
+    job = my_job(request, jid)
     if job["status"] not in ACTIVE:
         raise HTTPException(409, "not running")
     return public(store.update(jid, cancel=True, stage="Cancelling"))
 
 
 @app.delete("/api/jobs/{jid}")
-def delete(jid: str):
-    if store.get(jid)["status"] in ACTIVE:
+def delete(request: Request, jid: str):
+    if my_job(request, jid)["status"] in ACTIVE:
         raise HTTPException(409, "cancel it first")
     store.delete(jid)
     return {"ok": True}
 
 
 @app.get("/media/{jid}/{name}")
-def media(jid: str, name: str, dl: int = 0):
+def media(request: Request, jid: str, name: str, dl: int = 0):
     if name not in ("input.jpg", "raw.mp4", "meme.mp4"):
         raise HTTPException(404)
-    job = store.get(jid)
+    job = my_job(request, jid)
     path = os.path.join(store.dir(jid), name)
     if not os.path.exists(path):
         raise HTTPException(404)
@@ -602,7 +718,8 @@ backend.resume()
 if __name__ == "__main__":
     import uvicorn
     host, port = os.getenv("PORTAL_HOST", "127.0.0.1"), int(os.getenv("PORTAL_PORT", "8000"))
-    if host not in ("127.0.0.1", "localhost") and not PASSWORD:
-        log.warning("listening on %s without PORTAL_PASSWORD: anyone who can reach it can spend GPU money", host)
-    log.info("Meme Studio on http://%s:%d (%s)", host, port, "MOCK mode" if MOCK else f"endpoint {backend.endpoint}")
+    if host not in ("127.0.0.1", "localhost") and AUTH_MODE == "open":
+        log.warning("listening on %s with no login: anyone who can reach it can spend GPU money", host)
+    log.info("Meme Studio on http://%s:%d (%s, login: %s)", host, port,
+             "MOCK mode" if MOCK else f"endpoint {backend.endpoint}", AUTH_MODE)
     uvicorn.run(app, host=host, port=port, log_level="warning")

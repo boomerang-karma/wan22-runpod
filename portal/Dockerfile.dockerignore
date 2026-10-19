@@ -1,0 +1,7 @@
+# Allowlist: the image gets only what the portal needs. Never config.yaml, .runpod_state.json or galleries.
+*
+!wanctl.py
+!config.example.yaml
+!portal/
+portal/**/__pycache__
+portal/Dockerfile*

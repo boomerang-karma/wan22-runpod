@@ -15,7 +15,12 @@
     <div class="brand"><span class="logo">MEME<span>STUDIO</span></span><span class="badge" id="mockBadge" hidden>MOCK</span></div>
     <div class="top-right">
       <div class="chip gpu" id="gpuChip" title=""><span class="dot"></span><span id="gpuLabel">Checking GPU…</span></div>
-      <div class="chip spend" id="spendChip" title="Estimated GPU spend today / daily budget">$0.00 / $5</div>
+      <div class="chip spend" id="spendChip" title="Estimated GPU spend today / your daily allowance">$0.00 / $5</div>
+      <div class="user" id="userBox" hidden>
+        <img id="userPic" alt="" referrerpolicy="no-referrer">
+        <span class="user-name" id="userName"></span>
+        <a class="logout" href="/logout">Log out</a>
+      </div>
     </div>
   </header>
 
@@ -126,15 +131,19 @@
     </div>
   </dialog>
 
-  <!-- password -->
+  <!-- sign in: Auth0 button or shared password -->
   <dialog id="login">
-    <form class="login" id="loginForm">
+    <div class="login">
       <div class="logo big">MEME<span>STUDIO</span></div>
-      <label for="pw">Password</label>
-      <input id="pw" type="password" autocomplete="current-password" required>
-      <button class="go" type="submit">Enter</button>
+      <p class="login-tag">Turn any photo into a meme video with sound. 🎬</p>
+      <a class="go" id="ssoBtn" href="/login" hidden>Sign in</a>
+      <form id="loginForm" hidden>
+        <label for="pw">Password</label>
+        <input id="pw" type="password" autocomplete="current-password" required>
+        <button class="go" type="submit">Enter</button>
+      </form>
       <p class="err" id="loginErr"></p>
-    </form>
+    </div>
   </dialog>
 
   <div class="toasts" id="toasts" aria-live="polite"></div>

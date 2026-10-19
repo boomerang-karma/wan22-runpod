@@ -13,3 +13,6 @@ __pycache__/
 # portal
 portal_data/
 .mock_portal/
+
+# AWS deploy settings (may hold the Auth0 client secret)
+deploy/aws/deploy.env

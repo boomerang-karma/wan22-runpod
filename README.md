@@ -9,7 +9,7 @@ RunPod serverless worker, plus a small CLI (`wanctl.py`). Each clip comes with a
 
 ## Status — what is verified and what is not
 
-| Verified here (CPU, `make test`, 59 tests) | Not verified (needs your first GPU run) |
+| Verified here (CPU, `make test`, 70 tests) | Not verified (needs your first GPU run) |
 |---|---|
 | Engine runs end to end on a tiny random LTX-2 (load → encode → 8-step stage 1 → x2 latent upsample → 3-step stage 2 → video + audio decode) | Real 22B weights on a real GPU: speed, peak VRAM, quality |
 | Single-stage draft path, seed determinism, prompt pre-encoding, OOM fallback | (Checked against the real `model_index.json` and shard indexes, 2026-10-09) |
@@ -127,18 +127,72 @@ PORTAL_MOCK=1 python portal/server.py                    # no GPU, no cost: fake
 * The header shows the GPU state (asleep / waking / warm / busy / waiting for a free GPU) and today's estimated spend.
 * Jobs, photos and videos live in `portal_data/` (git-ignored). In-flight jobs resume after a server restart.
 
+**Who can get in** (first match wins):
+
+| Mode | Set | Galleries and limits |
+|---|---|---|
+| Auth0 login | `AUTH0_DOMAIN`, `AUTH0_CLIENT_ID`, `AUTH0_CLIENT_SECRET`, `PORTAL_BASE_URL`, `SESSION_SECRET` | one per user, plus per-user budget and job limits |
+| Shared password | `PORTAL_PASSWORD` | one shared gallery |
+| Open | nothing | local use only |
+
 | Env var | Default | |
 |---|---|---|
-| `PORTAL_PASSWORD` | — | **Set this before sharing the URL**: visitors enter it once (30-day cookie) |
-| `PORTAL_DAILY_BUDGET_USD` | `5` | refuses new jobs once today's estimated spend would pass this |
-| `PORTAL_MAX_ACTIVE` | `3` | max queued + running jobs |
+| `PORTAL_ALLOWED_EMAILS` | — | with Auth0: optional guest list, e.g. `me@x.com,@mycompany.com` (verified emails only) |
+| `PORTAL_DAILY_BUDGET_USD` | `5` | refuses new jobs once today's estimated spend (whole portal) would pass this |
+| `PORTAL_USER_DAILY_BUDGET_USD` | the global one | the same per signed-in user |
+| `PORTAL_MAX_ACTIVE` / `PORTAL_USER_MAX_ACTIVE` | `3` / the global one | max queued + running jobs, overall / per user |
+| `RUNPOD_API_KEY` + `RUNPOD_ENDPOINT_ID` | — | use these instead of `config.yaml` / `.runpod_state.json` (containers) |
 | `PORTAL_HOST` / `PORTAL_PORT` | `127.0.0.1` / `8000` | use `0.0.0.0` to serve your LAN |
 | `PORTAL_DATA` | `./portal_data` | gallery storage |
 
-**Sharing it:** run with a password and expose the port with a tunnel, e.g.
-`PORTAL_PASSWORD=... python portal/server.py` then `cloudflared tunnel --url http://127.0.0.1:8000`
-(or ngrok). Everyone shares one gallery and one budget. With `workers_max: 1`, memes run one at a time; raise
-`endpoint.idle_timeout_s` (e.g. 60) during a session so back-to-back memes skip the 2–5 min cold start.
+To try Auth0 locally, add `http://localhost:8000/auth/callback` to the Auth0 app's callback URLs and run with
+`PORTAL_BASE_URL=http://localhost:8000` plus the three `AUTH0_*` variables.
+
+With `workers_max: 1`, memes run one at a time; raise `endpoint.idle_timeout_s` (e.g. 60) during a busy session so
+back-to-back memes skip the 2–5 min cold start.
+
+## Deploy Meme Studio to AWS (with Auth0 login)
+
+```
+browser ──HTTPS──▶ CloudFront ──(secret header)──▶ ALB ──▶ Fargate task (ARM64, 1) ──▶ RunPod endpoint
+                   *.cloudfront.net or your domain  only CloudFront   │  Auth0 login, captions (ffmpeg)
+                                                                     └─ EFS: photos, videos, jobs, spend
+CodeBuild builds portal/Dockerfile ──▶ ECR          Secrets Manager: RunPod key, Auth0 secret, session key
+```
+
+Everything is one CloudFormation stack (`deploy/aws/template.yaml`). `deploy/aws/deploy.sh` needs only the AWS
+CLI: it uploads the portal source to S3 and CodeBuild builds the image, so no local Docker is needed.
+
+**1. Auth0 (once):** in the Auth0 dashboard, *Applications → Create Application → Regular Web Applications*. From
+its *Settings*, copy the Domain, Client ID and Client Secret. Optional: under *Authentication → Database* turn off
+sign-ups and invite people, or use `ALLOWED_EMAILS` below.
+
+**2. Settings:**
+```bash
+cp deploy/aws/deploy.env.example deploy/aws/deploy.env      # git-ignored
+# fill in AUTH0_DOMAIN, AUTH0_CLIENT_ID, AUTH0_CLIENT_SECRET (or export it), optionally ALLOWED_EMAILS
+```
+The RunPod endpoint and key are read from `config.yaml` / `.runpod_state.json`. The secrets go straight to
+Secrets Manager and are never stack parameters.
+
+**3. Deploy** (first run about 15 minutes, mostly CloudFront; later runs about 5):
+```bash
+deploy/aws/deploy.sh
+```
+It prints the app URL and the three Auth0 URLs to paste into the app's *Settings* (Allowed Callback URLs,
+Allowed Logout URLs, Allowed Web Origins). Save them in Auth0, then sign in.
+
+* **Update the app:** run `deploy/aws/deploy.sh` again (it deploys the working tree, committed or not). The
+  single task restarts, so there's about a minute of downtime; memes in flight resume.
+* **Change settings or rotate a secret:** edit `deploy.env`, then run `deploy/aws/deploy.sh --infra`.
+* **Custom domain:** set `DOMAIN_NAME` and `CERTIFICATE_ARN` (ACM, us-east-1), deploy, then CNAME the domain to the
+  `CloudFrontDomain` output and update the Auth0 URLs.
+* **Logs:** `aws logs tail /ecs/meme-studio --follow`
+* **Remove:** `deploy/aws/destroy.sh`. The gallery's EFS file system is kept; the script prints the delete command.
+
+**AWS cost (us-east-1 list prices, always on; estimates):** ALB ≈ $17, public IPv4 addresses ≈ $11,
+Fargate 0.5 vCPU / 1 GB ARM ≈ $15, EFS / Secrets Manager / logs / ECR ≈ $2. That's about **$45 a month** plus
+CloudFront traffic beyond the free tier, and RunPod GPU time for the memes (capped by the daily budgets).
 
 ## Knobs
 
@@ -172,13 +226,21 @@ PORTAL_MOCK=1 python portal/server.py                    # no GPU, no cost: fake
 * The RunPod key is sent only to `rest.runpod.io` and `api.runpod.ai`; the HF token only inside the prepare job.
   Neither is printed or written to the volume. `--dry-run` masks bucket secrets.
 * Input images are sent to RunPod as base64 in the job payload. Async job results stay retrievable for 30 minutes.
+* Meme Studio on AWS: the RunPod key, Auth0 client secret and session key live in Secrets Manager and reach the task
+  as environment variables. The load balancer only accepts CloudFront (prefix list plus a secret header), the task only
+  the load balancer, and EFS only the task. Sessions are signed, `httponly`, `Secure` and `SameSite=Lax` cookies
+  holding only the verified ID-token claims. The image is built from an allowlist (`portal/Dockerfile.dockerignore`),
+  so `config.yaml` can't end up in it.
 
 ## Layout
 
 ```
-portal/server.py         Meme Studio web app (FastAPI): jobs, captions, budget, password
+portal/server.py         Meme Studio web app (FastAPI): jobs, captions, budgets, login, per-user galleries
+portal/auth.py           Auth0 login (OIDC authorization code flow, ID-token verification, guest list)
 portal/presets.py        meme effects -> LTX-2.5 prompts
 portal/static/           the single-page UI (vanilla JS)
+portal/Dockerfile        the portal image (ffmpeg + Anton caption font); built by CodeBuild
+deploy/aws/              CloudFormation stack + deploy.sh / destroy.sh for AWS
 wanctl.py                CLI: init | check | deploy | prepare | info | generate | health | costs | teardown
 config.example.yaml      everything configurable; copy to config.yaml
 worker/handler.py        RunPod entry: actions, input validation, mp4 + AAC encode, inline/S3 output

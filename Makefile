@@ -1,7 +1,7 @@
 PY ?= python3
 IMAGE ?= $(shell $(PY) -c "import yaml;print(yaml.safe_load(open('config.yaml'))['image']['name'])" 2>/dev/null)
 
-.PHONY: setup test mock build deploy prepare info health costs teardown
+.PHONY: setup test mock build deploy prepare info health costs teardown portal portal-mock
 
 setup:            ## client deps (requests, pyyaml, pillow)
 	$(PY) -m pip install -r requirements-client.txt
@@ -23,3 +23,7 @@ info:    ; $(PY) wanctl.py info
 health:  ; $(PY) wanctl.py health
 costs:   ; $(PY) wanctl.py costs
 teardown:; $(PY) wanctl.py teardown
+portal:      ## Meme Studio web app on http://127.0.0.1:8000 (real endpoint)
+	$(PY) portal/server.py
+portal-mock: ## Meme Studio without a GPU (fake jobs, no cost)
+	PORTAL_MOCK=1 PORTAL_DATA=.mock_portal $(PY) portal/server.py

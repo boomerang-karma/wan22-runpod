@@ -9,7 +9,7 @@ RunPod serverless worker, plus a small CLI (`wanctl.py`). Each clip comes with a
 
 ## Status — what is verified and what is not
 
-| Verified here (CPU, `make test`, 29 tests) | Not verified (needs your first GPU run) |
+| Verified here (CPU, `make test`, 59 tests) | Not verified (needs your first GPU run) |
 |---|---|
 | Engine runs end to end on a tiny random LTX-2 (load → encode → 8-step stage 1 → x2 latent upsample → 3-step stage 2 → video + audio decode) | Real 22B weights on a real GPU: speed, peak VRAM, quality |
 | Single-stage draft path, seed determinism, prompt pre-encoding, OOM fallback | (Checked against the real `model_index.json` and shard indexes, 2026-10-09) |
@@ -108,6 +108,38 @@ python wanctl.py teardown             # endpoint + template; keeps the prepared 
 python wanctl.py teardown --volume    # also deletes the weights (re-prepare costs ~$1-3)
 ```
 
+## Meme Studio (web portal)
+
+A Higgsfield-style web app in front of the endpoint: drop a photo, pick an effect, add top/bottom text, get an mp4
+with sound. The RunPod key stays on the server; the browser only talks to `/api/*`.
+
+```bash
+python portal/server.py                                  # http://127.0.0.1:8000, uses config.yaml + .runpod_state.json
+PORTAL_MOCK=1 python portal/server.py                    # no GPU, no cost: fakes jobs with an ffmpeg zoom (UI work)
+```
+
+* **12 meme effects + Custom** (`portal/presets.py`): Dramatic Zoom, Vibing, Sitcom Laugh, Side Eye, Sad Violin,
+  Explosion Behind, Make Them Say It (your line, lip-synced), Victory Dance, Mind Blown, Slow-mo Hero, Shook, Smolder.
+  Each becomes a long LTX-2.5 prompt describing motion, camera **and sound**. "Who's in it?" fills in the subject.
+* **Draft / HD** (540p single-stage / 720p two-stage), **3 / 5 / 8 s**, **Auto / 9:16 / 1:1 / 16:9**, sound on/off.
+* **Captions** are burned in locally with ffmpeg after the GPU job (Impact, white with black outline), so editing
+  them later is free. **New take** re-rolls the seed; **Make it HD** re-renders a draft at 720p with the same seed.
+* The header shows the GPU state (asleep / waking / warm / busy / waiting for a free GPU) and today's estimated spend.
+* Jobs, photos and videos live in `portal_data/` (git-ignored). In-flight jobs resume after a server restart.
+
+| Env var | Default | |
+|---|---|---|
+| `PORTAL_PASSWORD` | — | **Set this before sharing the URL**: visitors enter it once (30-day cookie) |
+| `PORTAL_DAILY_BUDGET_USD` | `5` | refuses new jobs once today's estimated spend would pass this |
+| `PORTAL_MAX_ACTIVE` | `3` | max queued + running jobs |
+| `PORTAL_HOST` / `PORTAL_PORT` | `127.0.0.1` / `8000` | use `0.0.0.0` to serve your LAN |
+| `PORTAL_DATA` | `./portal_data` | gallery storage |
+
+**Sharing it:** run with a password and expose the port with a tunnel, e.g.
+`PORTAL_PASSWORD=... python portal/server.py` then `cloudflared tunnel --url http://127.0.0.1:8000`
+(or ngrok). Everyone shares one gallery and one budget. With `workers_max: 1`, memes run one at a time; raise
+`endpoint.idle_timeout_s` (e.g. 60) during a session so back-to-back memes skip the 2–5 min cold start.
+
 ## Knobs
 
 | Where | Setting | Effect |
@@ -144,6 +176,9 @@ python wanctl.py teardown --volume    # also deletes the weights (re-prepare cos
 ## Layout
 
 ```
+portal/server.py         Meme Studio web app (FastAPI): jobs, captions, budget, password
+portal/presets.py        meme effects -> LTX-2.5 prompts
+portal/static/           the single-page UI (vanilla JS)
 wanctl.py                CLI: init | check | deploy | prepare | info | generate | health | costs | teardown
 config.example.yaml      everything configurable; copy to config.yaml
 worker/handler.py        RunPod entry: actions, input validation, mp4 + AAC encode, inline/S3 output

@@ -1,0 +1,143 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Meme Studio</title>
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🎬</text></svg>">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Anton&family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+  <header class="top">
+    <div class="brand"><span class="logo">MEME<span>STUDIO</span></span><span class="badge" id="mockBadge" hidden>MOCK</span></div>
+    <div class="top-right">
+      <div class="chip gpu" id="gpuChip" title=""><span class="dot"></span><span id="gpuLabel">Checking GPU…</span></div>
+      <div class="chip spend" id="spendChip" title="Estimated GPU spend today / daily budget">$0.00 / $5</div>
+    </div>
+  </header>
+
+  <main class="layout">
+    <!-- ======================= create ======================= -->
+    <section class="create" aria-label="Create a meme">
+      <label class="drop" id="drop" tabindex="0">
+        <input type="file" id="file" accept="image/*" hidden>
+        <div class="drop-empty" id="dropEmpty">
+          <div class="drop-icon">＋</div>
+          <div class="drop-title">Drop a photo</div>
+          <div class="drop-sub">or click to upload · paste works too</div>
+        </div>
+        <div class="preview" id="preview" hidden>
+          <div class="frame">
+            <img id="previewImg" alt="">
+            <div class="cap cap-top" id="capTopPreview"></div>
+            <div class="cap cap-bottom" id="capBottomPreview"></div>
+          </div>
+          <button type="button" class="swap" id="swapBtn">Change photo</button>
+        </div>
+      </label>
+
+      <div class="field">
+        <label for="subject">Who's in it? <span class="opt">optional, makes it better</span></label>
+        <input id="subject" maxlength="200" placeholder="e.g. my grumpy orange cat, a guy in a suit">
+      </div>
+
+      <div class="field">
+        <div class="label-row"><span class="label">Effect</span><span class="hint" id="presetHint"></span></div>
+        <div class="presets" id="presets" role="radiogroup" aria-label="Meme effect"></div>
+      </div>
+
+      <div class="field" id="lineField" hidden>
+        <label for="line" id="lineLabel">What do they say?</label>
+        <input id="line" maxlength="300">
+      </div>
+      <div class="field" id="customField" hidden>
+        <label for="custom">Describe the motion <b>and</b> the sound</label>
+        <textarea id="custom" rows="4" maxlength="3000" placeholder="The dog slowly lowers its sunglasses and stares at the camera while a smooth jazz trumpet plays and a crowd gasps."></textarea>
+      </div>
+
+      <div class="field two">
+        <div><label for="capTop">Top text</label><input id="capTop" maxlength="200" placeholder="WHEN THE CODE WORKS"></div>
+        <div><label for="capBottom">Bottom text</label><input id="capBottom" maxlength="200" placeholder="ON THE FIRST TRY"></div>
+      </div>
+
+      <div class="settings">
+        <div class="seg" data-name="quality">
+          <button type="button" data-v="draft" title="540p, one pass, cheapest">⚡ Draft</button>
+          <button type="button" data-v="hd" title="720p, two-stage, sharper">✨ HD</button>
+        </div>
+        <div class="seg" data-name="duration">
+          <button type="button" data-v="3">3s</button>
+          <button type="button" data-v="5">5s</button>
+          <button type="button" data-v="8">8s</button>
+        </div>
+        <div class="seg" data-name="aspect">
+          <button type="button" data-v="auto">Auto</button>
+          <button type="button" data-v="9:16">9:16</button>
+          <button type="button" data-v="1:1">1:1</button>
+          <button type="button" data-v="16:9">16:9</button>
+        </div>
+        <button type="button" class="toggle" id="soundBtn" aria-pressed="true">🔊 Sound</button>
+      </div>
+      <details class="adv">
+        <summary>Advanced</summary>
+        <label for="seed">Seed <span class="opt">blank = random</span></label>
+        <input id="seed" inputmode="numeric" placeholder="random">
+      </details>
+
+      <button type="button" class="go" id="goBtn" disabled>
+        <span id="goText">Generate</span><span class="go-cost" id="goCost"></span>
+      </button>
+      <p class="go-note" id="goNote"></p>
+    </section>
+
+    <!-- ======================= feed ======================= -->
+    <section class="feed-wrap" aria-label="Your memes">
+      <div class="feed-head"><h2>Your memes</h2><span class="count" id="count"></span></div>
+      <div class="feed" id="feed"></div>
+      <div class="empty" id="empty" hidden>
+        <div class="empty-emoji">🎞️</div>
+        <p>Your memes show up here.<br>Drop a photo, pick an effect, hit Generate.</p>
+      </div>
+    </section>
+  </main>
+
+  <!-- viewer -->
+  <dialog id="viewer">
+    <div class="viewer">
+      <button type="button" class="x" id="vClose" aria-label="Close">✕</button>
+      <div class="v-media"><video id="vVideo" controls playsinline loop></video></div>
+      <div class="v-side">
+        <div class="v-title" id="vTitle"></div>
+        <div class="v-meta" id="vMeta"></div>
+        <div class="field"><label for="vTop">Top text</label><input id="vTop" maxlength="200"></div>
+        <div class="field"><label for="vBottom">Bottom text</label><input id="vBottom" maxlength="200"></div>
+        <button type="button" class="btn" id="vSaveCaps">Update captions <span class="free">free</span></button>
+        <div class="v-actions">
+          <a class="btn" id="vDownload" download>⬇ Download</a>
+          <button type="button" class="btn" id="vRemix">🎲 New take</button>
+          <button type="button" class="btn" id="vHd">✨ Make it HD</button>
+        </div>
+        <details class="v-prompt"><summary>Prompt sent to the model</summary><p id="vPrompt"></p></details>
+        <button type="button" class="btn danger" id="vDelete">Delete</button>
+      </div>
+    </div>
+  </dialog>
+
+  <!-- password -->
+  <dialog id="login">
+    <form class="login" id="loginForm">
+      <div class="logo big">MEME<span>STUDIO</span></div>
+      <label for="pw">Password</label>
+      <input id="pw" type="password" autocomplete="current-password" required>
+      <button class="go" type="submit">Enter</button>
+      <p class="err" id="loginErr"></p>
+    </form>
+  </dialog>
+
+  <div class="toasts" id="toasts" aria-live="polite"></div>
+  <script src="/static/app.js"></script>
+</body>
+</html>

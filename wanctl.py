@@ -156,7 +156,7 @@ def endpoint_payload(cfg: dict, template_id: str, volumes: dict[str, str]) -> di
     e = cfg["endpoint"]
     dcs = list(volumes)
     body = {"name": e["name"], "templateId": template_id, "computeType": "GPU", "gpuTypeIds": list(e["gpu_types"]),
-            "gpuCount": 1, "networkVolumeId": volumes[dcs[0]], "dataCenterIds": dcs,
+            "gpuCount": 1, "networkVolumeId": volumes[dcs[0]] if dcs else None, "dataCenterIds": dcs,
             "workersMin": int(e.get("workers_min", 0)), "workersMax": int(e.get("workers_max", 1)),
             "idleTimeout": int(e.get("idle_timeout_s", 5)),
             "executionTimeoutMs": int(e.get("execution_timeout_s", 900)) * 1000,
@@ -165,6 +165,40 @@ def endpoint_payload(cfg: dict, template_id: str, volumes: dict[str, str]) -> di
     body["networkVolumeIds"] = [volumes[dc] for dc in dcs]
     if e.get("min_cuda_version"):
         body["minCudaVersion"] = str(e["min_cuda_version"])
+    return body
+
+
+# ----------------------------------------------------------------------------------------------- model cache
+# RunPod model caching: the endpoint's Model field makes RunPod keep the Hugging Face repo on its hosts and mount it
+# at /runpod-volume/huggingface-cache/hub. No network volume, so workers may start in any serverless data center.
+# RunPod's API has no field for it yet: the Model field is set once in the console (deploy prints how).
+CACHE_REPO = "Lightricks/LTX-2.5-Diffusers"
+
+
+def cache_cfg(cfg: dict) -> dict:
+    return cfg.get("model_cache") or {}
+
+
+def cache_enabled(cfg: dict) -> bool:
+    return bool(cache_cfg(cfg).get("enabled"))
+
+
+def cache_endpoint_name(cfg: dict) -> str:
+    return cache_cfg(cfg).get("endpoint_name") or f"{cfg['endpoint']['name']}-cached"
+
+
+def cache_template_payload(cfg: dict) -> dict:
+    body = template_payload(cfg)
+    body["name"] = f"{cache_endpoint_name(cfg)}-tpl"
+    body["containerDiskInGb"] = int(cache_cfg(cfg).get("container_disk_gb", 40))     # no prepare: nothing to stage
+    body["env"].update({"MODEL_SOURCE": "cache", "LTX_REPO": CACHE_REPO, "HF_HUB_OFFLINE": "1"})
+    return body
+
+
+def cache_endpoint_payload(cfg: dict, template_id: str) -> dict:
+    body = endpoint_payload(cfg, template_id, {})
+    body.update({"name": cache_endpoint_name(cfg), "dataCenterIds": sorted(SERVERLESS_DCS), "networkVolumeIds": []})
+    body.pop("networkVolumeId")
     return body
 
 
@@ -284,6 +318,9 @@ def cmd_deploy(args) -> None:
 
     # 3. endpoint, limited to data centers whose volume holds the model
     ep_id = _update_endpoint(rp, cfg, st)
+    # 4. optional: a second endpoint that loads the model from RunPod's model cache (any data center)
+    if cache_enabled(cfg):
+        _deploy_cache(rp, cfg, st)
     if not args.dry_run:
         st.update({"endpoint_id": ep_id, "image": cfg["image"]["name"]})
         save_state(st)
@@ -304,7 +341,38 @@ def _update_endpoint(rp: RunPod, cfg: dict, st: dict) -> str:
     return ep_id
 
 
+def _deploy_cache(rp: RunPod, cfg: dict, st: dict) -> None:
+    tpl = cache_template_payload(cfg)
+    if st.get("cache_template_id"):
+        rp.rest("PATCH", f"/templates/{st['cache_template_id']}", {k: v for k, v in tpl.items() if k != "isServerless"})
+        print(f"cache template: updated {st['cache_template_id']}")
+    else:
+        st["cache_template_id"] = rp.rest("POST", "/templates", tpl)["id"]
+        print(f"cache template: created {st['cache_template_id']}")
+    ep = cache_endpoint_payload(cfg, st["cache_template_id"])
+    if st.get("cache_endpoint_id"):
+        rp.rest("PATCH", f"/endpoints/{st['cache_endpoint_id']}", {k: v for k, v in ep.items() if k != "computeType"})
+        print(f"cache endpoint: updated {st['cache_endpoint_id']} (any of {len(ep['dataCenterIds'])} data centers)")
+    else:
+        st["cache_endpoint_id"] = rp.rest("POST", "/endpoints", ep)["id"]
+        print(f"cache endpoint: created {st['cache_endpoint_id']} (any of {len(ep['dataCenterIds'])} data centers)")
+    if not st.get("cache_verified"):
+        print(f"""
+  One manual step (RunPod has no API for it yet): console -> Serverless -> {ep['name']} -> Manage -> Edit Endpoint
+    Model: {CACHE_REPO}    and your Hugging Face token (the repo is gated). Save.
+  Then run `python wanctl.py info`. Once a worker reports the cached model, jobs move to this endpoint;
+  until then they keep using the volume endpoint.""")
+
+
+def serving(cfg: dict) -> str:
+    """'cache' once the cache endpoint has been verified by `info`, else 'volume'."""
+    st = load_state()
+    return "cache" if cache_enabled(cfg) and st.get("cache_endpoint_id") and st.get("cache_verified") else "volume"
+
+
 def _endpoint_id(cfg: dict) -> str:
+    if serving(cfg) == "cache":
+        return load_state()["cache_endpoint_id"]
     ep = load_state().get("endpoint_id") or (cfg.get("endpoint") or {}).get("id")
     if not ep:
         raise CtlError("no endpoint id — run `python wanctl.py deploy` first")
@@ -400,9 +468,22 @@ def cmd_prepare(args) -> None:
 
 def cmd_info(args) -> None:
     cfg = load_config(args.config)
+    state = load_state()
     rp, ep = RunPod(api_key(cfg)), _endpoint_id(cfg)
+    checking_cache = cache_enabled(cfg) and state.get("cache_endpoint_id") and not state.get("cache_verified")
+    if checking_cache:
+        ep = state["cache_endpoint_id"]
+        print(f"checking the model-cache endpoint {ep} (jobs still go to the volume endpoint until it passes)")
     st = run_job(rp, ep, {"input": {"action": "info"}}, poll_s=5)
-    print(json.dumps(st.get("output") or st.get("error"), indent=2))
+    out = st.get("output") or st.get("error")
+    print(json.dumps(out, indent=2))
+    if checking_cache:
+        if isinstance(out, dict) and out.get("ready") and out.get("model_source") == "cache":
+            state["cache_verified"] = True
+            save_state(state)
+            print(f"\nmodel cache verified on {out.get('gpu')}: jobs now go to {ep} (any data center)")
+        else:
+            print("\nthe cache endpoint isn't serving yet; jobs stay on the volume endpoint")
 
 
 def cmd_health(args) -> None:
@@ -526,6 +607,8 @@ def cmd_teardown(args) -> None:
     cfg = load_config(args.config)
     rp, st = RunPod(api_key(cfg)), _volumes_state(load_state())
     what = [f"endpoint {st.get('endpoint_id')}", f"template {st.get('template_id')}"]
+    if st.get("cache_endpoint_id"):
+        what.append(f"model-cache endpoint {st['cache_endpoint_id']} + template {st.get('cache_template_id')}")
     if args.volume:
         what.append(f"network volumes {st.get('volumes')} (deletes the prepared ~71 GB model in each region)")
     if not args.yes:
@@ -542,6 +625,16 @@ def cmd_teardown(args) -> None:
         rp.rest("DELETE", f"/templates/{st['template_id']}", ok404=True)
         print("template deleted")
         st.pop("template_id")
+    if st.get("cache_endpoint_id"):
+        rp.rest("PATCH", f"/endpoints/{st['cache_endpoint_id']}", {"workersMin": 0, "workersMax": 0})
+        rp.rest("DELETE", f"/endpoints/{st['cache_endpoint_id']}", ok404=True)
+        print("cache endpoint deleted")
+        st.pop("cache_endpoint_id")
+        st.pop("cache_verified", None)
+    if st.get("cache_template_id"):
+        rp.rest("DELETE", f"/templates/{st['cache_template_id']}", ok404=True)
+        print("cache template deleted")
+        st.pop("cache_template_id")
     if args.volume:
         for dc, vol in list(st.get("volumes", {}).items()):
             rp.rest("DELETE", f"/networkvolumes/{vol}", ok404=True)

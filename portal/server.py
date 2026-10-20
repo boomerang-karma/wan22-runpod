@@ -275,7 +275,7 @@ class Backend:
     def __init__(self, store: Store):
         self.store = store
         self.cfg: dict = {}
-        self.endpoint = ""
+        self.fixed_endpoint = ""                            # set in containers; locally wanctl decides per job
         self._health: tuple[float, dict] = (0.0, {})
         if MOCK:
             return
@@ -284,11 +284,24 @@ class Backend:
             with open(os.path.join(ROOT, "config.example.yaml")) as f:
                 self.cfg = yaml.safe_load(f)                # pricing table + idle timeout for cost estimates
             self.cfg["runpod"]["data_centers"] = [d for d in os.getenv("RUNPOD_DATA_CENTER", "").split(",") if d]
-            self.endpoint = os.environ["RUNPOD_ENDPOINT_ID"]
+            self.fixed_endpoint = os.environ["RUNPOD_ENDPOINT_ID"]
         else:
             self.cfg = wanctl.load_config(CONFIG)
-            self.endpoint = wanctl._endpoint_id(self.cfg)
+            wanctl._endpoint_id(self.cfg)                   # fail at startup if nothing is deployed
         self.key = wanctl.api_key(self.cfg)
+
+    @property
+    def endpoint(self) -> str:
+        """Where new jobs go. Locally this follows wanctl, so a switch to the model-cache endpoint (after
+        `wanctl.py info` verifies it) takes effect without restarting the portal."""
+        if MOCK:
+            return "mock"
+        return self.fixed_endpoint or wanctl._endpoint_id(self.cfg)
+
+    def regions(self) -> str:
+        if not self.fixed_endpoint and wanctl.serving(self.cfg) == "cache":
+            return "any region"
+        return ", ".join(wanctl.data_centers(self.cfg)) or "the endpoint's data centers"
 
     def rp(self) -> wanctl.RunPod:
         return wanctl.RunPod(self.key)
@@ -304,7 +317,7 @@ class Backend:
             except Exception as e:                                    # keep the page alive if RunPod blips
                 h = {"error": str(e)}
             self._health = (time.time(), h)
-        return describe_health(h, ", ".join(wanctl.data_centers(self.cfg)) or "the endpoint's data centers")
+        return describe_health(h, self.regions())
 
     # one thread per job
     def start(self, jid: str) -> None:
@@ -347,17 +360,20 @@ class Backend:
             inp = {"action": "generate", "image_base64": img, "prompt": job["prompt"], "width": job["width"],
                    "height": job["height"], "two_stage": job["quality"] == "hd", "num_frames": job["num_frames"],
                    "fps": FPS, "crf": CRF, "audio": job["audio"], "seed": job["seed"]}
-            rid = rp.sls("POST", self.endpoint, "/run", {"input": inp, "policy": {"executionTimeout": 900_000}})["id"]
-            job = self.store.update(jid, runpod_id=rid)
-            log.info("job %s -> runpod %s", jid, rid)
+            ep = self.endpoint
+            rid = rp.sls("POST", ep, "/run", {"input": inp, "policy": {"executionTimeout": 900_000}})["id"]
+            job = self.store.update(jid, runpod_id=rid, runpod_endpoint=ep)
+            log.info("job %s -> runpod %s on %s", jid, rid, ep)
         rid = job["runpod_id"]
+        # keep polling where the job was sent (jobs from before this field existed went to the volume endpoint)
+        ep = job.get("runpod_endpoint") or self.fixed_endpoint or wanctl.load_state().get("endpoint_id")
         cancelled = False
         while True:
             if self.store.get(jid).get("cancel") and not cancelled:
-                rp.sls("POST", self.endpoint, f"/cancel/{rid}")
+                rp.sls("POST", ep, f"/cancel/{rid}")
                 cancelled = True
             try:
-                st = rp.sls("GET", self.endpoint, f"/status/{rid}")
+                st = rp.sls("GET", ep, f"/status/{rid}")
             except wanctl.CtlError as e:
                 if "404" in str(e):
                     raise RuntimeError("RunPod no longer has this job (results expire after 30 min)")

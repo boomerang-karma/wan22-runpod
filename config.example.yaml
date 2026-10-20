@@ -40,6 +40,13 @@ endpoint:
   container_disk_gb: 120            # prepare streams the source (76 GB fp32 transformer) through here one part at a time
   min_cuda_version: "13.0"          # must match the torch build in worker/Dockerfile (PyPI torch 2.14.1 = CUDA 13.0)
 
+model_cache:                        # RunPod model caching: a second endpoint loads the model from RunPod's per-host
+  enabled: false                    # cache instead of a network volume, so workers may start in ANY data center.
+  endpoint_name: ""                 # default: <endpoint.name>-cached
+  container_disk_gb: 40
+  # After deploy, set the endpoint's Model field once in the console (deploy prints how), then `wanctl.py info`.
+  # Jobs move to it only after `info` sees a worker load the cached model.
+
 worker_env:                         # passed to the worker as environment variables
   MEMORY_MODE: resident             # resident (80 GB GPU) | offload (48 GB GPU, needs ~80 GB host RAM)
   VAE_TILING: "1"                   # tiled decode keeps 1080p within 80 GB; "0" is slightly faster at 540p/720p

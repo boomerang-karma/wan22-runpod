@@ -153,3 +153,41 @@ def test_oversized_output_without_bucket_is_an_error_not_a_truncated_payload(tmp
     out = h.handler({"id": "g", "input": {"prompt": "x", "image_base64": _img_b64(), "resolution": "540p",
                                           "num_frames": 9}})
     assert "video_base64" not in out and "bucket" in out["error"]
+
+
+def _fake_cache(volume, sha="abc123", ref=True):
+    root = volume / "huggingface-cache" / "hub" / "models--Lightricks--LTX-2.5-Diffusers"
+    snap = root / "snapshots" / sha
+    snap.mkdir(parents=True)
+    (snap / "model_index.json").write_text("{}")
+    if ref:
+        (root / "refs").mkdir()
+        (root / "refs" / "main").write_text(sha + "\n")
+    return snap
+
+
+def test_model_cache_worker_finds_the_snapshot_and_generates(tmp_path, monkeypatch):
+    monkeypatch.setenv("MODEL_SOURCE", "cache")
+    snap = _fake_cache(tmp_path)
+    h = _fresh_handler(tmp_path)
+    assert h.MODEL_DIR == str(snap)
+    info = h.handler({"id": "i", "input": {"action": "info"}})
+    assert info["ready"] is True and info["model_source"] == "cache"
+    out = h.handler({"id": "g", "input": {"prompt": "cake", "image_base64": _img_b64(), "resolution": "540p",
+                                          "num_frames": 25, "seed": 2}})
+    assert "error" not in out and out["video_base64"]
+    assert "nothing to prepare" in h.handler({"id": "p", "input": {"action": "prepare"}})["error"]
+
+
+def test_model_cache_falls_back_to_newest_snapshot_without_refs(tmp_path, monkeypatch):
+    monkeypatch.setenv("MODEL_SOURCE", "cache")
+    snap = _fake_cache(tmp_path, sha="def456", ref=False)
+    assert _fresh_handler(tmp_path).MODEL_DIR == str(snap)
+
+
+def test_model_cache_missing_is_a_clear_error_not_a_restart_loop(tmp_path, monkeypatch):
+    monkeypatch.setenv("MODEL_SOURCE", "cache")
+    h = _fresh_handler(tmp_path)
+    out = h.handler({"id": "g", "input": {"prompt": "x", "image_base64": _img_b64()}})
+    assert "model not cached" in out["error"] and "Model field" in out["error"]
+    assert "refresh_worker" not in out

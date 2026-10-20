@@ -272,8 +272,12 @@ class LTXEngine:
             raise ValueError("memory_mode must be 'resident' or 'offload'")
         t0 = time.time()
         self.device, self.memory_mode, self.dtype = device, memory_mode, dtype
-        with open(os.path.join(model_dir, MARKER)) as f:
-            self.meta = json.load(f)
+        if os.path.exists(os.path.join(model_dir, MARKER)):
+            with open(os.path.join(model_dir, MARKER)) as f:
+                self.meta = json.load(f)
+        else:                          # RunPod's model cache: the Hugging Face snapshot itself (same component folders)
+            self.meta = {"source": SRC_REPO, "source_revision": os.path.basename(os.path.normpath(model_dir)),
+                         "from": "runpod model cache"}
         with open(os.path.join(model_dir, "model_index.json")) as f:
             index = json.load(f)
         on = device if memory_mode == "resident" else None

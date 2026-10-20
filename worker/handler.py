@@ -32,7 +32,33 @@ log = logging.getLogger("handler")
 PROCESS_START = time.time()
 MODE = os.getenv("WORKER_MODE", "real")                    # "real" | "mock" (CPU, for local tests)
 VOLUME = os.getenv("VOLUME_PATH", "/runpod-volume")
-MODEL_DIR = os.path.join(VOLUME, os.getenv("MODEL_SUBDIR", "ltx25-i2v-distilled-bf16"))
+# "volume": the copy `prepare` wrote to a network volume (one region per volume).
+# "cache": RunPod model caching (the endpoint's Model field) mounts the Hugging Face cache of the repo on the host,
+#          so no network volume is needed and workers may start in any data center.
+MODEL_SOURCE = os.getenv("MODEL_SOURCE", "volume")
+CACHE_REPO = os.getenv("LTX_REPO", "Lightricks/LTX-2.5-Diffusers")
+
+
+def cached_model_dir(volume: str = VOLUME, repo: str = CACHE_REPO) -> str | None:
+    """The snapshot of `repo` in RunPod's model cache (<volume>/huggingface-cache/hub, Hugging Face cache layout):
+    the one refs/main names, else the newest snapshot that holds a model_index.json."""
+    root = os.path.join(volume, "huggingface-cache", "hub", "models--" + repo.replace("/", "--"))
+    snaps = os.path.join(root, "snapshots")
+    candidates = []
+    try:
+        with open(os.path.join(root, "refs", "main")) as f:
+            candidates.append(os.path.join(snaps, f.read().strip()))
+    except OSError:
+        pass
+    if os.path.isdir(snaps):
+        candidates += sorted((os.path.join(snaps, d) for d in os.listdir(snaps)), key=os.path.getmtime, reverse=True)
+    return next((c for c in candidates if os.path.isfile(os.path.join(c, "model_index.json"))), None)
+
+
+if MODEL_SOURCE == "cache":
+    MODEL_DIR = cached_model_dir() or os.path.join(VOLUME, "huggingface-cache", "hub")
+else:
+    MODEL_DIR = os.path.join(VOLUME, os.getenv("MODEL_SUBDIR", "ltx25-i2v-distilled-bf16"))
 WORK_DIR = os.getenv("WORK_DIR", "/tmp/ltx_work")         # container disk; needs ~80 GB free during prepare
 MEMORY_MODE = os.getenv("MEMORY_MODE", "resident")
 VAE_TILING = os.getenv("VAE_TILING", "1") == "1"
@@ -56,7 +82,13 @@ MIN_FREE_GPU_FRAC = float(os.getenv("MIN_FREE_GPU_FRAC", "0.9"))   # refuse a GP
 
 def _load_engine() -> None:
     global ENGINE, LOAD_ERROR, COLD_START_S
-    if not os.path.exists(os.path.join(MODEL_DIR, engine_mod.MARKER)):
+    if MODEL_SOURCE == "cache":
+        if not os.path.isfile(os.path.join(MODEL_DIR, "model_index.json")):
+            LOAD_ERROR = (f"model not cached: no {CACHE_REPO} snapshot under {MODEL_DIR}; set the endpoint's Model "
+                          f"field to {CACHE_REPO} (RunPod console -> endpoint -> Manage -> Edit Endpoint)")
+            log.warning(LOAD_ERROR)
+            return
+    elif not os.path.exists(os.path.join(MODEL_DIR, engine_mod.MARKER)):
         LOAD_ERROR = f"model not prepared at {MODEL_DIR}; run the 'prepare' action once (python wanctl.py prepare)"
         log.warning(LOAD_ERROR)
         return
@@ -239,7 +271,8 @@ def _progress(job: dict, msg: str) -> None:
 def _broken(out: dict) -> dict:
     """A worker whose GPU or model failed to load (bad host, CUDA error 802, busy GPU, ...) asks RunPod to replace
     it; otherwise it stays "ready" and fails every job routed to it. An unprepared volume is not a host problem."""
-    if MODE == "mock" or ENGINE is not None or (LOAD_ERROR or "").startswith("model not prepared"):
+    if MODE == "mock" or ENGINE is not None or (LOAD_ERROR or "").startswith(("model not prepared",
+                                                                                  "model not cached")):
         return out
     log.error("worker cannot serve (%s); asking RunPod to replace it", LOAD_ERROR)
     return {"refresh_worker": True, "job_results": out}
@@ -248,12 +281,14 @@ def _broken(out: dict) -> dict:
 def do_info() -> dict:
     meta = getattr(ENGINE, "meta", None)
     return {"ready": ENGINE is not None, "error": LOAD_ERROR, "mode": MODE, "model": "LTX-2.5 distilled (I2V + audio)",
-            "memory_mode": MEMORY_MODE,
+            "memory_mode": MEMORY_MODE, "model_source": MODEL_SOURCE,
             "model_dir": MODEL_DIR, "gpu": getattr(ENGINE, "gpu", None), "cold_start_s": COLD_START_S,
             "prepared": meta, "full_quality": bool(getattr(ENGINE, "has_full", False)), "inline_limit_mb": INLINE_LIMIT_MB, "bucket": _bucket_configured()}
 
 
 def do_prepare(job: dict, inp: dict) -> dict:
+    if MODEL_SOURCE == "cache":
+        return {"error": "nothing to prepare: this endpoint loads the model from RunPod's model cache"}
     device = "cpu" if MODE == "mock" else "cuda"
     token = inp.get("hf_token") or os.getenv("HF_TOKEN") or None       # gated repo; never echoed back
     res = engine_mod.prepare(MODEL_DIR, WORK_DIR, device=device, force=bool(inp.get("force")),

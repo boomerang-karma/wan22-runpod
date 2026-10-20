@@ -201,3 +201,72 @@ def test_prepare_needs_an_hf_token_and_sends_it_only_in_the_job(tmp_path, monkey
 def test_gitignore_protects_secrets():
     ignored = open(os.path.join(ROOT, ".gitignore")).read().split()
     assert {"config.yaml", ".runpod_state.json", ".env"} <= set(ignored)
+
+
+# ------------------------------------------------------------------ RunPod model cache endpoint
+def test_cache_endpoint_has_no_volume_and_any_data_center():
+    c = cfg(model_cache={"enabled": True})
+    tpl = wanctl.cache_template_payload(c)
+    assert tpl["name"] == "wan22-i2v-lightning-cached-tpl" and tpl["containerDiskInGb"] == 40
+    assert tpl["env"]["MODEL_SOURCE"] == "cache" and tpl["env"]["LTX_REPO"] == "Lightricks/LTX-2.5-Diffusers"
+    ep = wanctl.cache_endpoint_payload(c, "ctpl")
+    assert ep["templateId"] == "ctpl" and ep["networkVolumeIds"] == [] and "networkVolumeId" not in ep
+    assert set(ep["dataCenterIds"]) == wanctl.SERVERLESS_DCS and ep["gpuTypeIds"] == c["endpoint"]["gpu_types"]
+
+
+def _cache_setup(tmp_path, monkeypatch, enabled=True):
+    p = tmp_path / "config.yaml"
+    p.write_text(yaml.safe_dump(cfg(model_cache={"enabled": enabled})))
+    os.chmod(p, 0o600)
+    monkeypatch.setattr(wanctl, "STATE_FILE", str(tmp_path / "state.json"))
+    wanctl.save_state({"template_id": "tpl", "endpoint_id": "main", "volumes": {"EU-RO-1": "v1"},
+                       "prepared": ["EU-RO-1"]})
+    calls = []
+
+    def rest(self, method, path, body=None, ok404=False):
+        calls.append((method, path, body))
+        if method == "GET" and path.startswith("/networkvolumes/"):
+            return {"id": "v1", "dataCenterId": "EU-RO-1", "size": 120}
+        return {"id": "ctpl" if path == "/templates" else "cached"} if method == "POST" else {}
+
+    monkeypatch.setattr(wanctl.RunPod, "rest", rest)
+    return p, calls
+
+
+def test_deploy_creates_cache_endpoint_but_jobs_stay_on_volume_until_verified(tmp_path, monkeypatch, capsys):
+    p, calls = _cache_setup(tmp_path, monkeypatch)
+    assert wanctl.main(["--config", str(p), "deploy"]) == 0
+    st = wanctl.load_state()
+    assert st["cache_template_id"] == "ctpl" and st["cache_endpoint_id"] == "cached"
+    assert ("POST", "/endpoints") in [(m, path) for m, path, _ in calls]
+    assert "Model: Lightricks/LTX-2.5-Diffusers" in capsys.readouterr().out      # the manual console step
+    c = wanctl.load_config(str(p))
+    assert wanctl.serving(c) == "volume" and wanctl._endpoint_id(c) == "main"
+
+
+def test_info_verifies_the_cache_endpoint_then_jobs_move(tmp_path, monkeypatch, capsys):
+    p, _ = _cache_setup(tmp_path, monkeypatch)
+    wanctl.main(["--config", str(p), "deploy"])
+    seen = []
+
+    def run_job(rp, ep, payload, poll_s, quiet=False, label=""):
+        seen.append(ep)
+        ok = len(seen) > 1                                      # first check: Model field not set yet
+        return {"status": "COMPLETED", "output": {"ready": ok, "model_source": "cache", "gpu": "H100",
+                                                  "error": None if ok else "model not cached: ..."}}
+
+    monkeypatch.setattr(wanctl, "run_job", run_job)
+    c = wanctl.load_config(str(p))
+    wanctl.main(["--config", str(p), "info"])
+    assert seen == ["cached"] and wanctl._endpoint_id(c) == "main"              # failed check: no switch
+    wanctl.main(["--config", str(p), "info"])
+    assert wanctl.load_state()["cache_verified"] is True and wanctl._endpoint_id(c) == "cached"
+    assert "jobs now go to cached" in capsys.readouterr().out
+
+
+def test_disabling_the_cache_falls_back_to_the_volume_endpoint(tmp_path, monkeypatch):
+    p, _ = _cache_setup(tmp_path, monkeypatch, enabled=False)
+    st = wanctl.load_state()
+    st.update(cache_endpoint_id="cached", cache_verified=True)
+    wanctl.save_state(st)
+    assert wanctl._endpoint_id(wanctl.load_config(str(p))) == "main"

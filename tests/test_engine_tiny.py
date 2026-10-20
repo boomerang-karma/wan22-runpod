@@ -132,3 +132,28 @@ def test_full_quality_without_weights_is_a_clear_error(engine, monkeypatch):
     monkeypatch.setattr(engine, "has_full", False)
     with pytest.raises(ValueError, match="prepare --full"):
         engine.generate(_img(), "x", width=64, height=64, num_frames=9, quality="full")
+
+
+def _as_hf_cache(snapshot: str, blobs: str) -> None:
+    """Turn a saved model folder into Hugging Face cache layout: every file a symlink into blobs/."""
+    os.makedirs(blobs, exist_ok=True)
+    for i, (d, _, names) in enumerate(os.walk(snapshot)):
+        for j, n in enumerate(names):
+            p = os.path.join(d, n)
+            blob = os.path.join(blobs, f"{i}-{j}")
+            os.replace(p, blob)
+            os.symlink(os.path.relpath(blob, d), p)
+
+
+def test_loads_from_runpod_model_cache_without_prepare(tmp_path):
+    """RunPod model caching mounts the repo's Hugging Face cache; the engine loads the snapshot as is."""
+    repo = tmp_path / "huggingface-cache" / "hub" / "models--Lightricks--LTX-2.5-Diffusers"
+    snap = repo / "snapshots" / "da0b690960"
+    build_tiny_model_dir(str(snap), marker=False)
+    _as_hf_cache(str(snap), str(repo / "blobs"))
+    e = ltx_engine.LTXEngine(str(snap), device="cpu", memory_mode="resident", vae_tiling=False, dtype=torch.float32)
+    assert e.meta == {"source": ltx_engine.SRC_REPO, "source_revision": "da0b690960", "from": "runpod model cache"}
+    assert e.has_full
+    frames, wav, _, _ = e.generate(_img(), "a cat laughing", width=64, height=64, num_frames=5, two_stage=False,
+                                   seed=1)
+    assert frames.shape == (5, 64, 64, 3) and wav is not None

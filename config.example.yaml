@@ -40,6 +40,8 @@ endpoint:
   container_disk_gb: 120            # prepare streams the source (76 GB fp32 transformer) through here one part at a time
   min_cuda_version: "13.0"          # must match the torch build in worker/Dockerfile (PyPI torch 2.14.1 = CUDA 13.0)
 
+backend: runpod                     # where the portal sends memes: modal (deploy/modal/ltx_app.py) | runpod
+
 model_cache:                        # RunPod model caching: a second endpoint loads the model from RunPod's per-host
   enabled: false                    # cache instead of a network volume, so workers may start in ANY data center.
   endpoint_name: ""                 # default: <endpoint.name>-cached

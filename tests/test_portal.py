@@ -1,5 +1,6 @@
 """Meme portal in mock mode: presets -> prompt, captions, the full job flow through the HTTP API, and the guards
 (password, budget, capacity). Needs ffmpeg for the video steps."""
+import base64
 import io
 import os
 import shutil
@@ -319,3 +320,96 @@ def test_spend_ledger_per_user_and_old_format(tmp_path):
     assert st.spent_today() == 0.5 and st.spent_today("a") == 0.0
     st.add_spend(0.25, "a")
     assert st.spent_today() == 0.75 and st.spent_today("a") == 0.25 and st.spent_today("b") == 0.0
+
+
+# ------------------------------------------------------------------ Modal backend (fake Modal client, no network)
+class _FakeCall:
+    def __init__(self, result, polls=2):
+        self.object_id, self.result, self.polls, self.cancelled = "fc-123", result, polls, False
+
+    def get(self, timeout=None):
+        if self.cancelled:
+            raise RuntimeError("cancelled")
+        if self.polls:
+            self.polls -= 1
+            raise TimeoutError()
+        return self.result
+
+    def cancel(self, terminate_containers=False):
+        self.cancelled = True
+
+
+def _modal_backend(monkeypatch, tmp_path, call):
+    import modal
+    import types
+    sent = []
+
+    class Run:
+        def spawn(self, inp):
+            sent.append(inp)
+            return call
+
+        def get_current_stats(self):
+            return types.SimpleNamespace(num_total_runners=0, num_running_inputs=0, backlog=0)
+
+    board = {"fc-123": "denoise step 4/8"}
+    monkeypatch.setattr(modal.Cls, "from_name", lambda app, name: (lambda: types.SimpleNamespace(run=Run())))
+    monkeypatch.setattr(modal.Dict, "from_name", lambda name, create_if_missing=False: board)
+    monkeypatch.setattr(modal.FunctionCall, "from_id", lambda cid: call)
+    monkeypatch.setattr(server, "POLL_S", 0.01)
+    monkeypatch.setattr(server, "MOCK", False)
+    monkeypatch.setenv("PORTAL_BACKEND", "modal")
+    st = server.Store(str(tmp_path))
+    b = server.Backend(st)
+    return b, st, sent
+
+
+def _queued_job(st, tmp_path):
+    jid = "j1"
+    os.makedirs(st.dir(jid))
+    Image.new("RGB", (544, 960), (1, 2, 3)).save(os.path.join(st.dir(jid), "input.jpg"))
+    st.save({"id": jid, "created": time.time(), "status": "queued", "owner": "local", "prompt": "p", "width": 544,
+             "height": 960, "quality": "draft", "num_frames": 73, "audio": True, "seed": 7, "caption_top": "",
+             "caption_bottom": "", "preset": "vibing"})
+    return jid
+
+
+@needs_ffmpeg
+def test_modal_backend_runs_a_job_and_estimates_cost(monkeypatch, tmp_path):
+    d = tmp_path / "v"
+    d.mkdir()
+    subprocess.run(["ffmpeg", "-loglevel", "error", "-f", "lavfi", "-i", "color=c=red:s=544x960:d=1", "-c:v",
+                    "libx264", "-pix_fmt", "yuv420p", str(d / "a.mp4")], check=True)
+    video = base64.b64encode((d / "a.mp4").read_bytes()).decode()
+    call = _FakeCall({"video_base64": video, "seed": 7, "gpu": "NVIDIA A100-SXM4-80GB",
+                      "timings": {"handler_total_s": 60, "cold_start_s": 100}})
+    b, st, sent = _modal_backend(monkeypatch, tmp_path, call)
+    assert b.endpoint == "modal:ltx-memes" and b.health()["state"] == "asleep"
+    jid = _queued_job(st, tmp_path)
+    b._run(jid)
+    job = st.get(jid)
+    assert job["status"] == "completed", job.get("error")
+    assert job["modal_call_id"] == "fc-123" and sent[0]["width"] == 544 and sent[0]["seed"] == 7
+    rate = server.MODAL_GPU_USD_S["A100"] + server.MODAL_HOST_USD_S
+    assert job["cost_usd"] == round((60 + 100 + server.MODAL_SCALEDOWN_S) * rate, 4)
+    assert st.spent_today("local") == job["cost_usd"]
+
+
+def test_modal_backend_reports_worker_errors_and_cancels(monkeypatch, tmp_path):
+    b, st, _ = _modal_backend(monkeypatch, tmp_path, _FakeCall({"error": "model not prepared at /weights/x"}, 0))
+    jid = _queued_job(st, tmp_path)
+    b._run(jid)
+    assert st.get(jid)["status"] == "failed" and "not prepared" in st.get(jid)["error"]
+
+    call = _FakeCall({}, polls=1000)
+    b, st, _ = _modal_backend(monkeypatch, tmp_path / "c", call)
+    jid = _queued_job(st, tmp_path)
+    st.update(jid, cancel=True)
+    b._run(jid)
+    assert call.cancelled and st.get(jid)["status"] == "cancelled"
+
+
+def test_modal_cost_falls_back_to_h100_rate_for_unknown_gpus():
+    out = {"gpu": "Mystery GPU", "timings": {"handler_total_s": 10}}
+    rate = server.MODAL_GPU_USD_S["H100"] + server.MODAL_HOST_USD_S
+    assert server.modal_cost(out) == round((10 + server.MODAL_SCALEDOWN_S) * rate, 4)

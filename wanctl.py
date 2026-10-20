@@ -640,7 +640,7 @@ def cmd_teardown(args) -> None:
             rp.rest("DELETE", f"/networkvolumes/{vol}", ok404=True)
             print(f"network volume {dc} deleted")
             st["volumes"].pop(dc)
-        st["prepared"] = []
+        st["prepared"], st["prepared_full"] = [], []
     save_state(st)
 
 

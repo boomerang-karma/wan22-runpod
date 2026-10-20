@@ -91,6 +91,12 @@ CRF = 23                                                            # keeps 8 s 
 EST_USD_PER_CLIP_S = {"draft": 0.006, "hd": 0.011}
 COLD_START_USD = 0.25
 ACTIVE = ("queued", "running")
+# Modal (deploy/modal/ltx_app.py): USD per second (modal.com/pricing, Oct 2026), matched against the GPU name the
+# worker reports. The container also bills 4 cores + 64 GiB and stays warm for its scaledown window after a job.
+MODAL_APP, MODAL_CLS, MODAL_PROGRESS = "ltx-memes", "LTX", "ltx-memes-progress"
+MODAL_GPU_USD_S = {"B200": 0.001736, "H200": 0.001261, "H100": 0.001097, "A100": 0.000694, "RTX PRO 6000": 0.001097}
+MODAL_HOST_USD_S = 4 * 0.0000131 + 64 * 0.00000222
+MODAL_SCALEDOWN_S = 120
 FFMPEG = shutil.which("ffmpeg")
 FONTS = ("/System/Library/Fonts/Supplemental/Impact.ttf", "/Library/Fonts/Impact.ttf",
          "/usr/share/fonts/truetype/msttcorefonts/Impact.ttf", "C:/Windows/Fonts/impact.ttf",
@@ -277,7 +283,15 @@ class Backend:
         self.cfg: dict = {}
         self.fixed_endpoint = ""                            # set in containers; locally wanctl decides per job
         self._health: tuple[float, dict] = (0.0, {})
+        self.provider = "mock" if MOCK else "runpod"
         if MOCK:
+            return
+        local_cfg = wanctl.load_config(CONFIG) if os.path.exists(CONFIG) else {}
+        self.provider = (os.getenv("PORTAL_BACKEND") or local_cfg.get("backend") or "runpod").lower()
+        if self.provider == "modal":                        # Modal auth: ~/.modal.toml or MODAL_TOKEN_ID/SECRET
+            import modal
+            self._modal_run = modal.Cls.from_name(MODAL_APP, MODAL_CLS)().run
+            self._modal_board = modal.Dict.from_name(MODAL_PROGRESS, create_if_missing=True)
             return
         if os.getenv("RUNPOD_ENDPOINT_ID"):                 # container: no config.yaml, settings from env
             import yaml
@@ -296,6 +310,8 @@ class Backend:
         `wanctl.py info` verifies it) takes effect without restarting the portal."""
         if MOCK:
             return "mock"
+        if self.provider == "modal":
+            return f"modal:{MODAL_APP}"
         return self.fixed_endpoint or wanctl._endpoint_id(self.cfg)
 
     def regions(self) -> str:
@@ -310,6 +326,8 @@ class Backend:
         if MOCK:
             busy = self.store.active() > 0
             return {"state": "busy" if busy else "warm", "label": "Mock GPU", "detail": "PORTAL_MOCK=1: no RunPod calls"}
+        if self.provider == "modal":
+            return self._modal_health()
         t, h = self._health
         if time.time() - t > 5:
             try:
@@ -325,7 +343,7 @@ class Backend:
 
     def _run(self, jid: str) -> None:
         try:
-            (self._run_mock if MOCK else self._run_runpod)(jid)
+            {"mock": self._run_mock, "modal": self._run_modal}.get(self.provider, self._run_runpod)(jid)
         except Exception as e:
             log.exception("job %s failed", jid)
             self.store.update(jid, status="failed", error=str(e), finished=time.time())
@@ -352,14 +370,92 @@ class Backend:
         mock_video(self.store.dir(jid), job["width"], job["height"], job["num_frames"])
         self._finish(jid, {"gpu": "mock", "seed": job["seed"]}, cost=0.0, exec_ms=None, delay_ms=None)
 
+    def _job_input(self, job: dict) -> dict:
+        with open(os.path.join(self.store.dir(job["id"]), "input.jpg"), "rb") as f:
+            img = base64.b64encode(f.read()).decode()
+        return {"action": "generate", "image_base64": img, "prompt": job["prompt"], "width": job["width"],
+                "height": job["height"], "two_stage": job["quality"] == "hd", "num_frames": job["num_frames"],
+                "fps": FPS, "crf": CRF, "audio": job["audio"], "seed": job["seed"]}
+
+    def _save_video(self, jid: str, out: dict) -> None:
+        d = self.store.dir(jid)
+        if "video_base64" in out:
+            with open(os.path.join(d, "raw.mp4"), "wb") as f:
+                f.write(base64.b64decode(out.pop("video_base64")))
+        elif "video_url" in out:
+            with requests.get(out["video_url"], stream=True, timeout=120) as r, \
+                    open(os.path.join(d, "raw.mp4"), "wb") as f:
+                r.raise_for_status()
+                shutil.copyfileobj(r.raw, f)
+        else:
+            raise RuntimeError("the worker returned no video")
+
+    # ---- Modal
+    def _modal_health(self) -> dict:
+        t, h = self._health
+        if time.time() - t > 5:
+            try:
+                s = self._modal_run.get_current_stats()
+                h = {"runners": s.num_total_runners, "running": s.num_running_inputs, "backlog": s.backlog}
+            except Exception as e:
+                h = {"error": str(e)}
+            self._health = (time.time(), h)
+        if "error" in h:
+            return {"state": "unknown", "label": "Can't reach Modal", "detail": h["error"][:200]}
+        if h["running"]:
+            return {"state": "busy", "label": "GPU busy (Modal)", "detail": f"{h['backlog']} waiting"}
+        if h["runners"]:
+            return {"state": "warm", "label": "GPU warm (Modal)", "detail": "next meme starts right away"}
+        if h["backlog"]:
+            return {"state": "waking", "label": "GPU waking up (Modal)", "detail": "loading the model, 2-4 min"}
+        return {"state": "asleep", "label": "GPU asleep (Modal)",
+                "detail": "scaled to zero (costs nothing); the first meme loads the model, 2-4 min"}
+
+    def _run_modal(self, jid: str) -> None:
+        import modal
+        job = self.store.get(jid)
+        if not job.get("modal_call_id"):
+            call = self._modal_run.spawn(self._job_input(job))
+            job = self.store.update(jid, modal_call_id=call.object_id)
+            log.info("job %s -> modal %s", jid, call.object_id)
+        call_id = job["modal_call_id"]
+        call = modal.FunctionCall.from_id(call_id)
+        cancelled = False
+        while True:
+            if self.store.get(jid).get("cancel") and not cancelled:
+                call.cancel()
+                cancelled = True
+            try:
+                out = call.get(timeout=0)
+                break
+            except (TimeoutError, modal.exception.TimeoutError):
+                try:
+                    note = self._modal_board.get(call_id)
+                except Exception:
+                    note = None
+                if note:
+                    self._stage(jid, "running", note)
+                elif not cancelled:
+                    self._stage(jid, "queued", "Starting a GPU on Modal (after a break it loads the model, 2-4 min)")
+                time.sleep(POLL_S)
+            except modal.exception.OutputExpiredError:
+                raise RuntimeError("Modal no longer has this result")
+            except Exception as e:
+                if cancelled:
+                    self.store.update(jid, status="cancelled", stage="", finished=time.time())
+                    return
+                raise RuntimeError(f"Modal job failed: {e}")
+        if not isinstance(out, dict) or out.get("error"):
+            raise RuntimeError((out or {}).get("error") if isinstance(out, dict) else f"unexpected result: {out!r}")
+        self._save_video(jid, out)
+        cost = modal_cost(out)
+        self._finish(jid, out, cost=cost, exec_ms=None, delay_ms=None)
+
+    # ---- RunPod
     def _run_runpod(self, jid: str) -> None:
         rp, job = self.rp(), self.store.get(jid)
         if not job.get("runpod_id"):
-            with open(os.path.join(self.store.dir(jid), "input.jpg"), "rb") as f:
-                img = base64.b64encode(f.read()).decode()
-            inp = {"action": "generate", "image_base64": img, "prompt": job["prompt"], "width": job["width"],
-                   "height": job["height"], "two_stage": job["quality"] == "hd", "num_frames": job["num_frames"],
-                   "fps": FPS, "crf": CRF, "audio": job["audio"], "seed": job["seed"]}
+            inp = self._job_input(job)
             ep = self.endpoint
             rid = rp.sls("POST", ep, "/run", {"input": inp, "policy": {"executionTimeout": 900_000}})["id"]
             job = self.store.update(jid, runpod_id=rid, runpod_endpoint=ep)
@@ -393,17 +489,7 @@ class Backend:
                 out = st.get("output") or {}
                 if out.get("error"):
                     raise RuntimeError(out["error"])
-                d = self.store.dir(jid)
-                if "video_base64" in out:
-                    with open(os.path.join(d, "raw.mp4"), "wb") as f:
-                        f.write(base64.b64decode(out.pop("video_base64")))
-                elif "video_url" in out:
-                    with requests.get(out["video_url"], stream=True, timeout=120) as r, \
-                            open(os.path.join(d, "raw.mp4"), "wb") as f:
-                        r.raise_for_status()
-                        shutil.copyfileobj(r.raw, f)
-                else:
-                    raise RuntimeError("the worker returned no video")
+                self._save_video(jid, out)
                 cost = wanctl.estimate_cost(self.cfg, out, st.get("executionTime"))
                 self._finish(jid, out, cost=cost.get("usd_est") or 0.0, exec_ms=st.get("executionTime"),
                              delay_ms=st.get("delayTime"))
@@ -432,10 +518,20 @@ class Backend:
         """After a restart: keep polling RunPod jobs still in flight; local mock jobs cannot resume."""
         for job in list(self.store.jobs.values()):
             if job["status"] in ACTIVE:
-                if job.get("runpod_id") and not MOCK:
+                if (job.get("runpod_id") or job.get("modal_call_id")) and not MOCK:
                     self.start(job["id"])
                 else:
                     self.store.update(job["id"], status="failed", error="the portal restarted before this job was sent")
+
+
+def modal_cost(out: dict) -> float:
+    """Estimated USD for one Modal job: GPU + host while it ran, plus the model load on a fresh container and the
+    scaledown window it then waits (billed)."""
+    gpu = out.get("gpu") or ""
+    rate = next((r for k, r in MODAL_GPU_USD_S.items() if k in gpu), MODAL_GPU_USD_S["H100"]) + MODAL_HOST_USD_S
+    t = out.get("timings") or {}
+    seconds = float(t.get("handler_total_s") or 0) + float(t.get("cold_start_s") or 0) + MODAL_SCALEDOWN_S
+    return round(seconds * rate, 4)
 
 
 def describe_health(h: dict, dc: str) -> dict:

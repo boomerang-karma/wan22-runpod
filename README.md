@@ -9,7 +9,7 @@ RunPod serverless worker, plus a small CLI (`wanctl.py`). Each clip comes with a
 
 ## Status — what is verified and what is not
 
-| Verified here (CPU, `make test`, 70 tests) | Not verified (needs your first GPU run) |
+| Verified here (CPU, `make test`, 85 tests) | Not verified (needs your first GPU run) |
 |---|---|
 | Engine runs end to end on a tiny random LTX-2 (load → encode → 8-step stage 1 → x2 latent upsample → 3-step stage 2 → video + audio decode) | Real 22B weights on a real GPU: speed, peak VRAM, quality |
 | Single-stage draft path, seed determinism, prompt pre-encoding, OOM fallback | (Checked against the real `model_index.json` and shard indexes, 2026-10-09) |
@@ -151,6 +151,36 @@ To try Auth0 locally, add `http://localhost:8000/auth/callback` to the Auth0 app
 With `workers_max: 1`, memes run one at a time; raise `endpoint.idle_timeout_s` (e.g. 60) during a busy session so
 back-to-back memes skip the 2–5 min cold start.
 
+## Run the model on Modal instead of RunPod
+
+`deploy/modal/ltx_app.py` runs the same worker code (`worker/handler.py`, `worker/ltx_engine.py`) on Modal. The
+weights sit on a Modal Volume and GPUs come from Modal's whole pool, so no region is pinned. Modal tries the cheapest
+80 GB card first: A100-80GB, then H100, RTX PRO 6000, H200, B200.
+
+```bash
+python -m modal setup                                   # once: sign in (writes ~/.modal.toml)
+make modal-deploy                                       # create/update the app: no GPU time
+make modal-prepare                                      # once: ~155 GB of weights onto the Volume (CPU, ~20-40 min)
+make modal-info                                         # start a GPU container, report what it loaded (billed)
+python -m modal run deploy/modal/ltx_app.py::generate --image photo.jpg --prompt "..."
+```
+
+With `backend: modal` in `config.yaml` (or `PORTAL_BACKEND=modal`), the portal sends memes to Modal. Progress shows up
+live, and the cost of each meme is estimated from Modal's prices.
+
+**Cost (Modal list prices, Oct 2026):**
+* **Idle:** $0 once scaled to zero. The Volume fits Modal's free 1 TiB, and the Starter plan includes $30 of credits a month.
+* **Running:** A100-80GB $0.000694/s, H100 $0.001097/s, plus about $0.0002/s for the 4 cores and 64 GiB.
+* **After each job:** a container stays warm for 120 s (`SCALEDOWN_S`, billed).
+
+| Item | Estimate |
+|---|---|
+| Draft meme on a warm container | ≈ $0.05 |
+| Model load after a break (2–4 min) | ≈ $0.10–0.20 |
+| One-time weights download (CPU) | ≈ $0.20–0.35 |
+
+The Hugging Face token is sent only in the prepare call; it isn't stored on Modal.
+
 ## Deploy Meme Studio to AWS (with Auth0 login)
 
 ```
@@ -241,6 +271,7 @@ portal/presets.py        meme effects -> LTX-2.5 prompts
 portal/static/           the single-page UI (vanilla JS)
 portal/Dockerfile        the portal image (ffmpeg + Anton caption font); built by CodeBuild
 deploy/aws/              CloudFormation stack + deploy.sh / destroy.sh for AWS
+deploy/modal/ltx_app.py  the same worker on Modal: GPU class, weights Volume, prepare / info / generate
 wanctl.py                CLI: init | check | deploy | prepare | info | generate | health | costs | teardown
 config.example.yaml      everything configurable; copy to config.yaml
 worker/handler.py        RunPod entry: actions, input validation, mp4 + AAC encode, inline/S3 output

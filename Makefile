@@ -1,7 +1,7 @@
 PY ?= python3
 IMAGE ?= $(shell $(PY) -c "import yaml;print(yaml.safe_load(open('config.yaml'))['image']['name'])" 2>/dev/null)
 
-.PHONY: setup test mock build deploy prepare info health costs teardown portal portal-mock aws-deploy aws-destroy
+.PHONY: setup test mock build deploy prepare info health costs teardown portal portal-mock aws-deploy aws-destroy modal-deploy modal-prepare modal-info
 
 setup:            ## client deps (requests, pyyaml, pillow)
 	$(PY) -m pip install -r requirements-client.txt
@@ -31,3 +31,9 @@ aws-deploy:  ## Meme Studio on AWS with Auth0 login (settings in deploy/aws/depl
 	deploy/aws/deploy.sh
 aws-destroy: ## delete the AWS stack (keeps the gallery's EFS)
 	deploy/aws/destroy.sh
+modal-deploy:  ## LTX worker on Modal (no GPU time until used)
+	$(PY) -m modal deploy deploy/modal/ltx_app.py
+modal-prepare: ## once: weights onto the Modal Volume (CPU, ~20-40 min)
+	$(PY) -m modal run deploy/modal/ltx_app.py::prepare
+modal-info:    ## start a GPU container and report what it loaded (billed)
+	$(PY) -m modal run deploy/modal/ltx_app.py::info

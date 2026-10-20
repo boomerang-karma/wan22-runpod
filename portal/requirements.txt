@@ -9,4 +9,5 @@ pillow==12.3.0
 itsdangerous==2.2.0
 pyjwt[crypto]==2.15.1
 cryptography==50.0.2
+opencv-python-headless==4.14.0 # counts faces to suggest Group quality
 modal==1.6.2                     # only used with the Modal backend

@@ -106,6 +106,26 @@ function setFile(f) {
   $("preview").hidden = false;
   $("dropEmpty").hidden = true;
   syncForm();
+  suggestGroup(f);
+}
+
+// Group photos degrade with the fast model; count faces and switch to Group quality (the user can switch back).
+async function suggestGroup(f) {
+  const fd = new FormData();
+  fd.append("image", f);
+  try {
+    const r = await fetch("/api/analyze", { method: "POST", body: fd });
+    if (!r.ok || state.file !== f) return;
+    const a = await r.json();
+    if (a.suggest_group && state.opts.quality !== "group") {
+      state.opts.quality = "group";
+      syncForm();
+      toast(`👨‍👩‍👧 ${a.faces} faces found: switched to Group quality so everyone stays recognisable`);
+    } else if (!a.suggest_group && state.opts.quality === "group") {
+      state.opts.quality = "draft";
+      syncForm();
+    }
+  } catch {}
 }
 
 async function generate() {
@@ -195,7 +215,7 @@ function card(job) {
   }
   const foot = el("div", "card-foot");
   foot.append(el("span", "t", `${job.emoji} ${job.caption_top || job.caption_bottom || job.preset_name}`));
-  const meta = [job.quality === "hd" ? "HD" : "Draft", `${job.duration}s`];
+  const meta = [{ hd: "HD", group: "Group" }[job.quality] || "Draft", `${job.duration}s`];
   if (job.status === "completed" && job.cost_usd != null) meta.push(money(job.cost_usd));
   foot.append(el("span", "m", meta.join(" · ")));
   c.append(media, foot);
@@ -248,14 +268,14 @@ function openViewer(id) {
   state.viewing = id;
   $("vVideo").src = job.video_url;
   $("vTitle").textContent = `${job.emoji} ${job.preset_name}`;
-  const meta = [job.quality === "hd" ? "HD" : "Draft", `${job.width}×${job.height}`, `${job.duration}s`, `seed ${job.seed}`];
+  const meta = [{ hd: "HD", group: "Group" }[job.quality] || "Draft", `${job.width}×${job.height}`, `${job.duration}s`, `seed ${job.seed}`];
   if (job.cost_usd != null) meta.push(`~${money(job.cost_usd)}`);
   if (job.gpu) meta.push(job.gpu);
   $("vMeta").textContent = meta.join(" · ");
   $("vTop").value = job.caption_top || "";
   $("vBottom").value = job.caption_bottom || "";
   $("vDownload").href = job.video_url.replace(/\?.*/, "") + "?dl=1";
-  $("vHd").hidden = job.quality === "hd";
+  $("vHd").hidden = job.quality !== "draft";
   $("vPrompt").textContent = job.prompt;
   $("viewer").showModal();
   $("vVideo").play().catch(() => {});

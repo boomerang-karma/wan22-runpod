@@ -9,6 +9,13 @@ from __future__ import annotations
 FALLBACK_SUBJECT = "the main subject of the photo"
 KEEP_LOOK = ("The framing, lighting, colours and identity of {subject} stay exactly as in the original photo, "
              "with natural, realistic motion.")
+# Group photos: one person performs the meme, everyone else stays put. Big motion on every face is what makes the
+# model invent new faces; small motion on the others keeps them recognisable.
+GROUP_SUBJECT = "the person in the centre of the photo"
+GROUP_KEEP = ("Everyone else in the photo stays in their place with only small, natural movements, smiling and "
+              "glancing at {subject}. Every person keeps exactly their own face, hair, body and clothes from the "
+              "original photo, nobody new appears and nobody leaves the frame. The camera stays steady with no zoom "
+              "or cut, and the lighting and background stay exactly as in the photo.")
 
 PRESETS: list[dict] = [
     {"id": "dramatic_zoom", "name": "Dramatic Zoom", "emoji": "🎬", "tag": "dun dun DUNNN",
@@ -92,11 +99,12 @@ def public() -> list[dict]:
     return [{k: p[k] for k in keys if k in p} for p in PRESETS]
 
 
-def build_prompt(preset_id: str, subject: str = "", line: str = "", custom: str = "") -> str:
+def build_prompt(preset_id: str, subject: str = "", line: str = "", custom: str = "", group: bool = False) -> str:
     p = BY_ID.get(preset_id)
     if p is None:
         raise PresetError(f"unknown preset '{preset_id}'")
-    subject = " ".join(subject.split())[:200] or FALLBACK_SUBJECT
+    subject = " ".join(subject.split())[:200] or (GROUP_SUBJECT if group else FALLBACK_SUBJECT)
+    keep = (GROUP_KEEP if group else KEEP_LOOK).format(subject=subject)
     line = " ".join(line.replace('"', "'").split())[:300]
     custom = " ".join(custom.split())[:3000]
     if p.get("needs_line") and not line:
@@ -104,7 +112,7 @@ def build_prompt(preset_id: str, subject: str = "", line: str = "", custom: str 
     if p.get("custom"):
         if len(custom) < 20:
             raise PresetError("describe the motion and the sound in at least a sentence")
-        return f"{custom} {KEEP_LOOK.format(subject=subject)}"
+        return f"{custom} {keep}"
     body = p["prompt"].format(subject=subject, line=line)
     body = body[0].upper() + body[1:]                    # "{subject}" may open the sentence
-    return f"{body} {KEEP_LOOK.format(subject=subject)}"
+    return f"{body} {keep}"

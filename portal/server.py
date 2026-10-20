@@ -88,7 +88,12 @@ FRAMES = {3: 73, 5: 121, 8: 193}                                     # 8k+1 fram
 FPS = 24
 CRF = 23                                                            # keeps 8 s HD under the 8 MB inline limit
 # Warm-worker estimate per second of clip (README cost table); the real cost is computed from billed time after.
-EST_USD_PER_CLIP_S = {"draft": 0.006, "hd": 0.011}
+EST_USD_PER_CLIP_S = {"draft": 0.006, "hd": 0.011, "group": 0.025}
+# Group photos: the full model (30 guided steps) with the photo pinned as first AND last frame keeps several faces
+# stable; the clip keeps the photo's own shape (long side 1280) so nobody is cropped out or shrunk.
+GROUP_LONG_SIDE = 1280
+GROUP_STEPS = 30
+GROUP_MIN_FACES = 3
 COLD_START_USD = 0.25
 ACTIVE = ("queued", "running")
 # Modal (deploy/modal/ltx_app.py): USD per second (modal.com/pricing, Oct 2026), matched against the GPU name the
@@ -182,6 +187,30 @@ class Store:
 
 
 # ----------------------------------------------------------------------------------------------- images & video
+def group_size(img: Image.Image) -> tuple[int, int]:
+    """The photo's own aspect (clamped to 9:16..16:9), long side GROUP_LONG_SIDE, sides on the 64-px grid."""
+    r = min(max(img.width / img.height, 9 / 16), 16 / 9)
+    w, h = (GROUP_LONG_SIDE, GROUP_LONG_SIDE / r) if r >= 1 else (GROUP_LONG_SIDE * r, GROUP_LONG_SIDE)
+    return max(256, round(w / 64) * 64), max(256, round(h / 64) * 64)
+
+
+def count_faces(img: Image.Image) -> int:
+    """Rough count of frontal faces (OpenCV Haar cascade); 0 when OpenCV is not installed. Faces hidden behind
+    hands or turned away are missed, so the UI only suggests Group quality; the user can always pick it."""
+    try:
+        import cv2
+        import numpy as np
+    except ImportError:
+        return 0
+    small = img.convert("L").copy()
+    small.thumbnail((1024, 1024))
+    det = cv2.CascadeClassifier(os.path.join(cv2.data.haarcascades, "haarcascade_frontalface_default.xml"))
+    side = min(small.size)
+    faces = det.detectMultiScale(np.asarray(small), scaleFactor=1.1, minNeighbors=6,
+                                 minSize=(max(20, side // 25),) * 2)
+    return len(faces)
+
+
 def pick_aspect(img: Image.Image, aspect: str) -> str:
     if aspect in ("9:16", "16:9", "1:1"):
         return aspect
@@ -373,9 +402,12 @@ class Backend:
     def _job_input(self, job: dict) -> dict:
         with open(os.path.join(self.store.dir(job["id"]), "input.jpg"), "rb") as f:
             img = base64.b64encode(f.read()).decode()
-        return {"action": "generate", "image_base64": img, "prompt": job["prompt"], "width": job["width"],
-                "height": job["height"], "two_stage": job["quality"] == "hd", "num_frames": job["num_frames"],
-                "fps": FPS, "crf": CRF, "audio": job["audio"], "seed": job["seed"]}
+        inp = {"action": "generate", "image_base64": img, "prompt": job["prompt"], "width": job["width"],
+               "height": job["height"], "two_stage": job["quality"] in ("hd", "group"), "num_frames": job["num_frames"],
+               "fps": FPS, "crf": CRF, "audio": job["audio"], "seed": job["seed"]}
+        if job["quality"] == "group":                    # full model + photo pinned at both ends
+            inp.update({"quality": "full", "steps": GROUP_STEPS, "loop": True})
+        return inp
 
     def _save_video(self, jid: str, out: dict) -> None:
         d = self.store.dir(jid)
@@ -722,12 +754,12 @@ def _check_capacity(me: str, quality: str, duration: int) -> None:
 
 def _new_job(request: Request, src_dir: str, *, preset: str, subject: str, line: str, custom: str, caption_top: str,
              caption_bottom: str, quality: str, aspect: str, duration: int, audio: bool, seed: Optional[int]) -> dict:
-    if quality not in SIZES:
-        raise HTTPException(400, "quality must be draft or hd")
+    if quality not in SIZES and quality != "group":
+        raise HTTPException(400, "quality must be draft, hd or group")
     if duration not in FRAMES:
         raise HTTPException(400, f"duration must be one of {sorted(FRAMES)} seconds")
     try:
-        prompt = presets.build_prompt(preset, subject=subject, line=line, custom=custom)
+        prompt = presets.build_prompt(preset, subject=subject, line=line, custom=custom, group=quality == "group")
     except presets.PresetError as e:
         raise HTTPException(400, str(e))
     user = request.state.user
@@ -737,8 +769,11 @@ def _new_job(request: Request, src_dir: str, *, preset: str, subject: str, line:
     os.makedirs(d)
     shutil.copy(os.path.join(src_dir, "source.jpg"), os.path.join(d, "source.jpg"))
     with Image.open(os.path.join(d, "source.jpg")) as img:
-        aspect = pick_aspect(img, aspect)
-    w, h = SIZES[quality][aspect]
+        if quality == "group":
+            aspect, (w, h) = "photo", group_size(img)
+        else:
+            aspect = pick_aspect(img, aspect)
+            w, h = SIZES[quality][aspect]
     crop_to(os.path.join(d, "source.jpg"), os.path.join(d, "input.jpg"), (w, h))
     p = presets.BY_ID[preset]
     job = {"id": jid, "created": time.time(), "status": "queued", "stage": "Sending to the GPU",
@@ -774,6 +809,20 @@ async def generate(request: Request, image: UploadFile = File(...), preset: str 
         return _new_job(request, t, preset=preset, subject=subject, line=line, custom=custom,
                         caption_top=caption_top, caption_bottom=caption_bottom, quality=quality, aspect=aspect,
                         duration=duration, audio=audio, seed=seed)
+
+
+@app.post("/api/analyze")
+async def analyze(image: UploadFile = File(...)):
+    """Face count for the chosen photo, so the UI can suggest Group quality before anything is spent."""
+    raw = await image.read(MAX_UPLOAD_MB * 2**20 + 1)
+    if len(raw) > MAX_UPLOAD_MB * 2**20:
+        raise HTTPException(413, f"image is larger than {MAX_UPLOAD_MB} MB")
+    try:
+        img = ImageOps.exif_transpose(Image.open(io.BytesIO(raw))).convert("RGB")
+    except Exception:
+        raise HTTPException(400, "that file isn't an image I can read")
+    faces = count_faces(img)
+    return {"faces": faces, "suggest_group": faces >= GROUP_MIN_FACES}
 
 
 @app.post("/api/jobs/{jid}/remix")

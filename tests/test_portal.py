@@ -413,3 +413,42 @@ def test_modal_cost_falls_back_to_h100_rate_for_unknown_gpus():
     out = {"gpu": "Mystery GPU", "timings": {"handler_total_s": 10}}
     rate = server.MODAL_GPU_USD_S["H100"] + server.MODAL_HOST_USD_S
     assert server.modal_cost(out) == round((10 + server.MODAL_SCALEDOWN_S) * rate, 4)
+
+
+# ------------------------------------------------------------------ group photos
+def test_group_prompt_keeps_everyone_else_in_place():
+    p = presets.build_prompt("victory_dance", group=True)
+    assert p.startswith("The person in the centre of the photo") and "Everyone else in the photo stays" in p
+    assert "nobody new appears" in p
+    assert "Everyone else" not in presets.build_prompt("victory_dance")             # single-subject unchanged
+
+
+def test_group_size_keeps_photo_shape_on_the_64px_grid():
+    for w, h in ((1072, 976), (4000, 3000), (900, 1600), (5000, 1000)):
+        gw, gh = server.group_size(Image.new("RGB", (w, h)))
+        assert gw % 64 == 0 and gh % 64 == 0 and max(gw, gh) <= 1280 + 32
+        assert abs(gw / gh - min(max(w / h, 9 / 16), 16 / 9)) < 0.08
+
+
+@needs_ffmpeg
+def test_group_job_uses_full_model_pinned_at_both_ends():
+    r = submit(_size=(1072, 976), quality="group")
+    assert r.status_code == 200, r.text
+    job = wait_done(r.json()["id"])
+    assert job["quality"] == "group" and (job["width"], job["height"]) == (1280, 1152)
+    inp = server.backend._job_input(server.store.jobs[job["id"]])
+    assert inp["quality"] == "full" and inp["loop"] is True and inp["two_stage"] is True and inp["steps"] == 30
+    assert "Everyone else in the photo stays" in inp["prompt"]
+
+
+def test_analyze_counts_faces_and_suggests_group(monkeypatch):
+    monkeypatch.setattr(server, "count_faces", lambda img: 4)
+    a = client.post("/api/analyze", files={"image": ("p.jpg", photo(), "image/jpeg")}).json()
+    assert a == {"faces": 4, "suggest_group": True}
+    monkeypatch.setattr(server, "count_faces", lambda img: 1)
+    assert client.post("/api/analyze", files={"image": ("p.jpg", photo(), "image/jpeg")}).json()["suggest_group"] is False
+    assert client.post("/api/analyze", files={"image": ("x.jpg", b"not an image", "image/jpeg")}).status_code == 400
+
+
+def test_count_faces_runs_on_a_blank_photo():
+    assert server.count_faces(Image.new("RGB", (800, 600), (128, 128, 128))) == 0
